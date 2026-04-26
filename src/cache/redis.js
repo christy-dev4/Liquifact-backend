@@ -7,6 +7,14 @@ const MAX_TTL_SECONDS = 300;
 const DEFAULT_LEDGER_GAP_THRESHOLD = 3;
 const MAX_LEDGER_GAP_THRESHOLD = 1000;
 
+/**
+ * Parses a raw value into a positive integer within a specified range.
+ * @param {any} rawValue The value to parse.
+ * @param {number} fallback The fallback value if parsing fails.
+ * @param {number} min The minimum allowed value.
+ * @param {number} max The maximum allowed value.
+ * @returns {number} The parsed integer or fallback.
+ */
 function parsePositiveInt(rawValue, fallback, min, max) {
   const parsed = Number.parseInt(String(rawValue || ''), 10);
   if (!Number.isFinite(parsed)) {
@@ -15,6 +23,11 @@ function parsePositiveInt(rawValue, fallback, min, max) {
   return Math.min(Math.max(parsed, min), max);
 }
 
+/**
+ * Parses Redis escrow cache configuration from environment variables.
+ * @param {Object} env The environment variables object.
+ * @returns {Object} The parsed configuration object.
+ */
 function parseRedisEscrowCacheConfig(env = process.env) {
   const enabled = String(env.REDIS_ESCROW_CACHE_ENABLED || '').toLowerCase() === 'true';
   const redisUrl = env.REDIS_URL || '';
@@ -37,6 +50,12 @@ function parseRedisEscrowCacheConfig(env = process.env) {
   };
 }
 
+/**
+ * Creates a Redis client based on the provided configuration.
+ * @param {Object} config The configuration object.
+ * @param {Function} [RedisCtor] Optional Redis constructor for testing.
+ * @returns {Object|null} The Redis client or null if not enabled.
+ */
 function createRedisClient(config = parseRedisEscrowCacheConfig(), RedisCtor) {
   if (!config.enabled) {
     return null;
@@ -50,11 +69,24 @@ function createRedisClient(config = parseRedisEscrowCacheConfig(), RedisCtor) {
   });
 }
 
+/**
+ * Validates an invoice ID.
+ * @param {string} invoiceId The invoice ID to validate.
+ * @returns {boolean} True if the invoice ID is valid.
+ */
 function isValidInvoiceId(invoiceId) {
   return typeof invoiceId === 'string' && /^[a-zA-Z0-9:_-]{1,128}$/.test(invoiceId);
 }
 
 class RedisEscrowSummaryCache {
+  /**
+   * Initializes the RedisEscrowSummaryCache.
+   * @param {Object} root0 Configuration object.
+   * @param {Object} root0.client The Redis client.
+   * @param {number} [root0.ttlSeconds] Time-to-live in seconds.
+   * @param {number} [root0.ledgerGapThreshold] Maximum allowed ledger gap.
+   * @param {string} [root0.keyPrefix] Prefix for Redis keys.
+   */
   constructor({
     client,
     ttlSeconds = DEFAULT_TTL_SECONDS,
@@ -67,10 +99,21 @@ class RedisEscrowSummaryCache {
     this.keyPrefix = keyPrefix;
   }
 
+  /**
+   * Generates a Redis key for a given invoice ID.
+   * @param {string} invoiceId The invoice ID.
+   * @returns {string} The Redis key.
+   */
   key(invoiceId) {
     return `${this.keyPrefix}:${invoiceId}`;
   }
 
+  /**
+   * Retrieves an escrow summary from the cache.
+   * @param {string} invoiceId The invoice ID.
+   * @param {number} [currentLedger] The current ledger sequence.
+   * @returns {Promise<Object>} The cache result including hit status and value.
+   */
   async getSummary(invoiceId, currentLedger) {
     if (!this.client || !isValidInvoiceId(invoiceId)) {
       return { hit: false, reason: 'invalid_input' };
@@ -95,11 +138,18 @@ class RedisEscrowSummaryCache {
       }
 
       return { hit: true, value: entry.summary };
-    } catch (_error) {
+    } catch {
       return { hit: false, reason: 'cache_error' };
     }
   }
 
+  /**
+   * Sets an escrow summary in the cache.
+   * @param {string} invoiceId The invoice ID.
+   * @param {Object} summary The summary object to cache.
+   * @param {number} [currentLedger] The current ledger sequence.
+   * @returns {Promise<boolean>} True if the summary was successfully cached.
+   */
   async setSummary(invoiceId, summary, currentLedger) {
     if (!this.client || !isValidInvoiceId(invoiceId)) {
       return false;
@@ -115,12 +165,20 @@ class RedisEscrowSummaryCache {
     try {
       await this.client.set(key, payload, 'EX', this.ttlSeconds);
       return true;
-    } catch (_error) {
+    } catch {
       return false;
     }
   }
 }
 
+/**
+ * Factory function to create a RedisEscrowSummaryCache instance.
+ * @param {Object} [root0] Configuration object.
+ * @param {Object} [root0.env] Environment variables.
+ * @param {Object} [root0.client] Optional Redis client.
+ * @param {Function} [root0.RedisCtor] Optional Redis constructor.
+ * @returns {RedisEscrowSummaryCache|null} The cache instance or null.
+ */
 function createRedisEscrowSummaryCache({ env = process.env, client, RedisCtor } = {}) {
   const config = parseRedisEscrowCacheConfig(env);
   const redisClient = client || createRedisClient(config, RedisCtor);

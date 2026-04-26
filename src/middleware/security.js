@@ -138,7 +138,12 @@
 'use strict';
 
 const helmet = require('helmet');
-function createSecurityMiddleware(options = {}) {
+/**
+ * Creates security middleware using Helmet.
+ * @param {Object} [_options] Configuration options.
+ * @returns {import('express').RequestHandler} Helmet middleware.
+ */
+function createSecurityMiddleware(_options = {}) {
   const isTest = process.env.NODE_ENV === 'test';
 
   return helmet({

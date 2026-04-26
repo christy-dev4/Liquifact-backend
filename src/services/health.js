@@ -7,14 +7,14 @@ const { getStellarConfig } = require('../config/stellar');
 
 /**
  * Checks if the Soroban RPC endpoint is reachable.
- * * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
+ * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
  */
 async function checkSorobanHealth() {
   let url;
   try {
     const stellarConfig = getStellarConfig();
     url = stellarConfig.rpcUrl;
-  } catch (error) {
+  } catch {
     return { status: 'unknown', error: 'Configuration not loaded or invalid' };
   }
 
@@ -45,7 +45,7 @@ async function checkSorobanHealth() {
 
 /**
  * Checks if the database is reachable (placeholder for future implementation).
- * * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
+ * @returns {Promise<{status: string, latency?: number, error?: string}>} Health status.
  */
 async function checkDatabaseHealth() {
   if (!process.env.DATABASE_URL) {
@@ -58,7 +58,7 @@ async function checkDatabaseHealth() {
 
 /**
  * Performs all dependency health checks.
- * * @returns {Promise<{healthy: boolean, checks: Object}>} Aggregated health status.
+ * @returns {Promise<{healthy: boolean, checks: Object}>} Aggregated health status.
  */
 async function performHealthChecks() {
   const [soroban, database] = await Promise.all([

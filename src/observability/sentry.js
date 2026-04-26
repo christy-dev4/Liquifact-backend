@@ -20,6 +20,11 @@ const SENSITIVE_FIELD_NAMES = [
 const REDACTED = '[REDACTED]';
 const REDACTED_INVOICE = '[REDACTED-INVOICE]';
 
+/**
+ * Checks if a given key is considered sensitive.
+ * @param {string} key The key to check.
+ * @returns {boolean} True if the key is sensitive.
+ */
 function isSensitiveField(key) {
   if (!key || typeof key !== 'string') {
     return false;
@@ -28,6 +33,12 @@ function isSensitiveField(key) {
   return SENSITIVE_FIELD_NAMES.some((name) => key.toLowerCase().includes(name));
 }
 
+/**
+ * Redacts a value if it is associated with a sensitive key or looks like a token.
+ * @param {string} key The key associated with the value.
+ * @param {any} value The value to potentially redact.
+ * @returns {any} The redacted or original value.
+ */
 function redactValue(key, value) {
   if (value == null) {
     return value;
@@ -56,6 +67,11 @@ function redactValue(key, value) {
   return value;
 }
 
+/**
+ * Checks if a string value looks like a sensitive token (e.g., JWT, Bearer token).
+ * @param {any} value The value to check.
+ * @returns {boolean} True if it looks like a sensitive token.
+ */
 function looksLikeSensitiveToken(value) {
   if (typeof value !== 'string') {
     return false;
@@ -70,6 +86,11 @@ function looksLikeSensitiveToken(value) {
   return tokenPatterns.some((pattern) => pattern.test(value));
 }
 
+/**
+ * Recursively scrubs sensitive fields from an object.
+ * @param {Object|Array} obj The object or array to scrub.
+ * @returns {Object|Array} The scrubbed object or array.
+ */
 function scrubObject(obj) {
   if (obj == null || typeof obj !== 'object') {
     return obj;
@@ -91,6 +112,11 @@ function scrubObject(obj) {
   return output;
 }
 
+/**
+ * Scrubs sensitive fields from a headers object.
+ * @param {Object} headers The headers object to scrub.
+ * @returns {Object} The scrubbed headers object.
+ */
 function scrubHeaders(headers) {
   if (!headers || typeof headers !== 'object') {
     return headers;
@@ -108,6 +134,11 @@ function scrubHeaders(headers) {
   return scrubbed;
 }
 
+/**
+ * Scrubs sensitive information from a Sentry event.
+ * @param {Object} event The Sentry event object.
+ * @returns {Object} The scrubbed event object.
+ */
 function scrubEvent(event) {
   if (!event || typeof event !== 'object') {
     return event;
@@ -146,6 +177,10 @@ function scrubEvent(event) {
   return safeEvent;
 }
 
+/**
+ * Initializes Sentry with the configured DSN and settings.
+ * @returns {void}
+ */
 function initSentry() {
   if (!SENTRY_DSN) {
     return;
@@ -168,11 +203,15 @@ function initSentry() {
   } catch (err) {
     enabled = false;
     // Avoid breaking startup if Sentry cannot be loaded or initialized.
-    // eslint-disable-next-line no-console
+     
     console.warn('Sentry initialization failed:', err.message || err);
   }
 }
 
+/**
+ * Returns the Sentry request handler middleware.
+ * @returns {import('express').RequestHandler} Express middleware.
+ */
 function requestHandler() {
   if (!enabled || !Sentry || !Sentry.Handlers || !Sentry.Handlers.requestHandler) {
     return (req, res, next) => next();
@@ -181,6 +220,12 @@ function requestHandler() {
   return Sentry.Handlers.requestHandler();
 }
 
+/**
+ * Captures an exception and sends it to Sentry, including request context if provided.
+ * @param {Error} error The exception to capture.
+ * @param {import('express').Request} [req] The Express request object.
+ * @returns {void}
+ */
 function captureException(error, req) {
   if (!enabled || !Sentry || !Sentry.withScope || !Sentry.captureException) {
     return;

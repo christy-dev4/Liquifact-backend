@@ -43,7 +43,9 @@
  * @param {object} req - Express request.
  * @param {object} res - Express response.
  * @param {function} next - Next middleware.
+ * @returns {void}
  */
+/*
 function adminAuth(req, res, next) {
   if (req.headers['x-api-key']) {
     return apiKeyAuth(req, res, next);
@@ -51,6 +53,7 @@ function adminAuth(req, res, next) {
     return authenticateToken(req, res, next);
   }
 }
+*/
 
 // /**
 //  * Create the Express application instance.
@@ -336,14 +339,14 @@ const {
 const { auditMiddleware } = require('./middleware/audit');
 const { globalLimiter, sensitiveLimiter } = require('./middleware/rateLimit');
 const { authenticateToken } = require('./middleware/auth');
-const { apiKeyAuth } = require('./middleware/apiKey');
+// const { apiKeyAuth } = require('./middleware/apiKey');
 const smeRouter = require('./routes/sme');
 const errorHandler = require('./middleware/errorHandler');
 const { callSorobanContract } = require('./services/soroban');
 const { performHealthChecks } = require('./services/health');
 const AppError = require('./errors/AppError');
 const logger = require('./logger');
-const sentry = require('./observability/sentry');
+// const sentry = require('./observability/sentry');
 const requestId = require('./middleware/requestId');
 const pinoHttp = require('pino-http');
 const investRoutes = require('./routes/invest');
@@ -354,6 +357,12 @@ const PORT = process.env.PORT || 3001;
 // In-memory storage
 let invoices = [];
 
+/**
+ * Parses a ledger sequence value into a positive integer.
+ *
+ * @param {unknown} value - The value to parse.
+ * @returns {number|null} The parsed sequence or null if invalid.
+ */
 function parseLedgerSequence(value) {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -365,6 +374,13 @@ function parseLedgerSequence(value) {
   return parsed;
 }
 
+/**
+ * Creates the Express application instance.
+ *
+ * @param {object} [options={}] - App options.
+ * @param {boolean} [options.enableTestRoutes] - Whether to enable test routes.
+ * @returns {import('express').Express} The Express application instance.
+ */
 function createApp(options = {}) {
   const { enableTestRoutes = false } = options;
 
@@ -379,8 +395,8 @@ function createApp(options = {}) {
       logger,
       genReqId: (req) => req.id,
       customLogLevel: (req, res, err) => {
-        if (res.statusCode >= 500 || err) return 'error';
-        if (res.statusCode >= 400) return 'warn';
+        if (res.statusCode >= 500 || err) {return 'error';}
+        if (res.statusCode >= 400) {return 'warn';}
         return 'info';
       },
       serializers: {
@@ -600,12 +616,22 @@ const app = createApp({
   enableTestRoutes: process.env.NODE_ENV === 'test',
 });
 
+/**
+ * Starts the Express server.
+ *
+ * @returns {import('http').Server} The server instance.
+ */
 function startServer() {
   return app.listen(PORT, () => {
     logger.warn(`API running at http://localhost:${PORT}`);
   });
 }
 
+/**
+ * Resets the in-memory invoice store.
+ *
+ * @returns {void}
+ */
 function resetStore() {
   invoices.length = 0;
 }
