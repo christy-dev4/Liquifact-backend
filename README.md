@@ -69,6 +69,45 @@ Do not store secrets in source control. Use `.env` locally and deployment secret
 
 ---
 
+## Stellar Network Configuration
+
+The API enforces a strict matching between `STELLAR_NETWORK` and `SOROBAN_RPC_URL` at boot time. This prevents misconfiguration where a passphrase (network identity) is paired with an incompatible RPC endpoint, which would cause on-chain validation failures.
+
+### Supported networks
+
+| Network | Passphrase | RPC URL |
+| --- | --- | --- |
+| TESTNET | `Test SDF Network ; September 2015` | `https://soroban-testnet.stellar.org` |
+| MAINNET | `Public Global Stellar Network ; September 2014` | `https://soroban.stellar.org` |
+| FUTURENET | `Test SDF Future Network ; October 2022` | `https://rpc-futurenet.stellar.org` |
+
+### Configuration
+
+Set both variables in your `.env`:
+
+```bash
+STELLAR_NETWORK=TESTNET
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+```
+
+Do NOT use custom RPC URLs. The validation will reject any deviation from the expected RPC for the selected network.
+
+### Boot-time validation
+
+On startup, `src/index.js` calls `validateStellarConfig()` from `src/config/stellar.js`. If the network/RPC combination is invalid, the server fails to start with a clear error message:
+
+```
+Error: Mismatch: STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org", but got "https://custom-rpc.example.com". This combination would cause on-chain validation failures.
+```
+
+### Security notes
+
+- The validation is a hard fail - no partial or degraded operation is permitted.
+- This ensures the backend never signs transactions with a mismatched network, which could result in fund loss.
+- The passphrase is derived from the network constant and is not user-configurable.
+
+---
+
 ## Development
 
 | Command | Description |
@@ -172,6 +211,65 @@ liquifact-backend/
 ├── .env.example
 ├── eslint.config.js
 └── package.json
+```
+
+---
+
+## Escrow Address Mapping
+
+The API supports invoice-to-escrow contract address resolution using environment-based configuration for early phases. This allows mapping invoice IDs to their corresponding Stellar escrow contract addresses without requiring on-chain registry lookups.
+
+### Configuration
+
+Configure escrow mappings using the `ESCROW_ADDR_BY_INVOICE` environment variable:
+
+```bash
+ESCROW_ADDR_BY_INVOICE='{"mappings":[{"invoiceId":"inv_demo_001","escrowAddress":"GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLM","environment":"development","isActive":true}],"defaultEnvironment":"development","allowlistEnabled":true,"cacheEnabled":true,"cacheTtlSeconds":300}'
+```
+
+### Security Features
+
+- **Allowlist Validation**: Only mapped invoices can be resolved
+- **Environment Separation**: Different mappings for development, staging, production
+- **Address Validation**: Ensures Stellar addresses are properly formatted
+- **Caching**: In-memory caching with configurable TTL
+- **Input Validation**: Strict validation of invoice IDs and addresses
+
+### Usage Examples
+
+The mapping system is automatically used by escrow endpoints. When resolving `/api/escrow/:invoiceId`, the system:
+
+1. Validates the invoice ID format
+2. Checks if the invoice is in the allowlist for the current environment
+3. Returns the corresponding Stellar escrow contract address
+4. Caches the result for subsequent requests
+
+### Rotation and Multi-Environment Support
+
+For production deployments:
+
+1. **Environment Separation**: Use different mappings per environment
+2. **Key Rotation**: Update mappings by modifying the environment variable
+3. **Monitoring**: Use health checks to validate mapping configuration
+4. **Security**: Only map invoices you own or have explicit permission to map
+
+### Configuration Schema
+
+```json
+{
+  "mappings": [
+    {
+      "invoiceId": "inv_123",
+      "escrowAddress": "GABC...123",
+      "environment": "development",
+      "isActive": true
+    }
+  ],
+  "defaultEnvironment": "development",
+  "allowlistEnabled": true,
+  "cacheEnabled": true,
+  "cacheTtlSeconds": 300
+}
 ```
 
 ---
