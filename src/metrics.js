@@ -27,20 +27,21 @@ client.collectDefaultMetrics({ register: registry });
  * @param {import('express').Request} req
  * @param {import('express').Response} res
  * @param {import('express').NextFunction} next
+ * @returns {void}
  */
 function metricsAuth(req, res, next) {
   const token = process.env.METRICS_BEARER_TOKEN;
 
   if (token) {
     const auth = req.headers['authorization'] || '';
-    if (auth === `Bearer ${token}`) return next();
+    if (auth === `Bearer ${token}`) {return next();}
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
   // No token configured — allow loopback only
   const ip = req.ip || req.socket.remoteAddress || '';
-  if (LOOPBACK.has(ip)) return next();
+  if (LOOPBACK.has(ip)) {return next();}
 
   res.status(401).json({ error: 'Unauthorized' });
 }

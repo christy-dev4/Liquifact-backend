@@ -174,8 +174,17 @@ The API is documented using OpenAPI 3.0 specification.
 
 - **OpenAPI JSON**: `GET /openapi.json` - Machine-readable API specification
 - **Interactive Docs**: `GET /docs` - Swagger UI for exploring and testing the API
+- **Correlation Strategy**: See [`docs/invoice-correlation.md`](./docs/invoice-correlation.md) for details on how `invoiceId` correlates with on-chain Stellar and Soroban data.
 
 The documentation covers all public endpoints including health checks, invoice management, escrow operations, and investment opportunities.
+
+- **Marketplace**: `GET /api/marketplace` - Search and sort invoices by yield, maturity, and funded ratio. Supports advanced filtering (`yieldBpsMin`, `maturityDateTo`, `fundedRatioMin`, etc.) and pagination.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer <token>" \
+     "http://localhost:3001/api/marketplace?yieldBpsMin=500&sortBy=yield_bps&order=desc"
+```
 
 ---
 

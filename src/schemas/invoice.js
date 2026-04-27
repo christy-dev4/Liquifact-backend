@@ -94,6 +94,11 @@ const paginationQuerySchema = z.object({
   }).optional(),
 });
 
+/**
+ * Parses Zod errors into a flatter field-mapped object.
+ * @param {import('zod').ZodError} zodError The Zod error object.
+ * @returns {Object} An object mapping field paths to error messages.
+ */
 function parseValidationErrors(zodError) {
   const fieldErrors = {};
   
@@ -109,6 +114,11 @@ function parseValidationErrors(zodError) {
   return fieldErrors;
 }
 
+/**
+ * Creates Express middleware to validate request body against a Zod schema.
+ * @param {import('zod').ZodSchema} schema The Zod schema to validate against.
+ * @returns {import('express').RequestHandler} Express middleware.
+ */
 function validateBody(schema) {
   return (req, res, next) => {
     try {
@@ -128,6 +138,11 @@ function validateBody(schema) {
   };
 }
 
+/**
+ * Creates Express middleware to validate request query parameters against a Zod schema.
+ * @param {import('zod').ZodSchema} schema The Zod schema to validate against.
+ * @returns {import('express').RequestHandler} Express middleware.
+ */
 function validateQuery(schema) {
   return (req, res, next) => {
     try {

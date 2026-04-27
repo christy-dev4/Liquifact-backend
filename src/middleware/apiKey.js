@@ -55,7 +55,7 @@ function validateApiKey(apiKey) {
     const keyHash = hashApiKey(apiKey);
     db.get('SELECT * FROM api_keys WHERE key_hash = ? AND is_active = 1', [keyHash], (err, row) => {
       db.close();
-      if (err) return reject(err);
+      if (err) {return reject(err);}
       resolve(row);
     });
   });
@@ -83,6 +83,7 @@ function updateAudit(keyId, action) {
  * @param {object} req - Express request.
  * @param {object} res - Express response.
  * @param {function} next - Next middleware.
+ * @returns {Promise<void>}
  */
 async function apiKeyAuth(req, res, next) {
   const apiKey = req.headers['x-api-key'];

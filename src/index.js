@@ -40,7 +40,9 @@ const invoiceFileRouter = require('./routes/invoiceFile');
  * @param {object} req - Express request.
  * @param {object} res - Express response.
  * @param {function} next - Next middleware.
+ * @returns {void}
  */
+/*
 function adminAuth(req, res, next) {
   if (req.headers['x-api-key']) {
     return apiKeyAuth(req, res, next);
@@ -48,6 +50,7 @@ function adminAuth(req, res, next) {
     return authenticateToken(req, res, next);
   }
 }
+*/
 
 // /**
 //  * Create the Express application instance.
@@ -306,10 +309,47 @@ function adminAuth(req, res, next) {
 //   startServer();
 // }
 
-const { apiKeyAuth } = require('./middleware/apiKey');
-const { problemJsonHandler } = require('./middleware/problemJson');
-const { resolveEscrowAddress } = require('./config/escrowMap');
-const sentry = require('./observability/sentry');
+// module.exports = app;
+// module.exports.createApp = createApp;
+// module.exports.startServer = startServer;
+// module.exports.resetStore = resetStore;
+'use strict';
+
+const express = require('express');
+const cors = require('cors');
+require('dotenv').config();
+
+const config = require('./config');
+// Fail-fast boot validation
+if (process.env.NODE_ENV !== 'test') {
+  config.validate();
+}
+
+const { createSecurityMiddleware } = require('./middleware/security');
+const { createCorsOptions } = require('./config/cors');
+const { correlationIdMiddleware } = require('./middleware/correlationId');
+const {
+  jsonBodyLimit,
+  urlencodedBodyLimit,
+  payloadTooLargeHandler,
+} = require('./middleware/bodySizeLimits');
+const { auditMiddleware } = require('./middleware/audit');
+const { globalLimiter, sensitiveLimiter } = require('./middleware/rateLimit');
+const { authenticateToken } = require('./middleware/auth');
+// const { apiKeyAuth } = require('./middleware/apiKey');
+const smeRouter = require('./routes/sme');
+const { problemJsonHandler, notFoundHandler } = require('./middleware/problemJson');
+const { callSorobanContract } = require('./services/soroban');
+const { performHealthChecks } = require('./services/health');
+const { resolveEscrowAddress, validateMappingConfig } = require('./config/escrowMap');
+const AppError = require('./errors/AppError');
+const logger = require('./logger');
+// const sentry = require('./observability/sentry');
+const requestId = require('./middleware/requestId');
+const pinoHttp = require('pino-http');
+const investRoutes = require('./routes/invest');
+const v1Router = require('./routes/v1');
+const invoiceFileRouter = require('./routes/invoiceFile');
 const investorRoutes = require('./routes/investor');
 const retentionRoutes = require('./routes/retention');
 const { createRedisEscrowSummaryCache } = require('./cache/redis');
@@ -326,6 +366,12 @@ const escrowSummaryCache = createRedisEscrowSummaryCache();
 // In-memory storage
 let invoices = [];
 
+/**
+ * Parses a ledger sequence value into a positive integer.
+ *
+ * @param {unknown} value - The value to parse.
+ * @returns {number|null} The parsed sequence or null if invalid.
+ */
 function parseLedgerSequence(value) {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -337,6 +383,13 @@ function parseLedgerSequence(value) {
   return parsed;
 }
 
+/**
+ * Creates the Express application instance.
+ *
+ * @param {object} [options={}] - App options.
+ * @param {boolean} [options.enableTestRoutes] - Whether to enable test routes.
+ * @returns {import('express').Express} The Express application instance.
+ */
 function createApp(options = {}) {
   const { enableTestRoutes = false } = options;
 
@@ -351,8 +404,8 @@ function createApp(options = {}) {
       logger,
       genReqId: (req) => req.id,
       customLogLevel: (req, res, err) => {
-        if (res.statusCode >= 500 || err) return 'error';
-        if (res.statusCode >= 400) return 'warn';
+        if (res.statusCode >= 500 || err) {return 'error';}
+        if (res.statusCode >= 400) {return 'warn';}
         return 'info';
       },
       serializers: {
@@ -388,12 +441,20 @@ function createApp(options = {}) {
   app.use(auditLogMiddleware);
   app.use(auditMiddleware);
 
+  // Deprecation middleware for /api paths
+  app.use('/api', (req, res, next) => {
+    res.set('Deprecation', 'true');
+    res.set('Warning', '299 - "This API version is deprecated. Please use /v1/ endpoints."');
+    next();
+  });
+
   // ───────── ROUTES ─────────
 
   app.use('/api/sme', smeRouter);
   app.use('/api/invest', investRoutes);
   app.use('/api/investor', investorRoutes);
   app.use('/api/invoices', invoiceFileRouter);
+  app.use('/v1', v1Router);
   app.use('/api/retention', retentionRoutes);
 
   app.get('/health', async (req, res) => {
@@ -897,10 +958,10 @@ function createApp(options = {}) {
   });
 
   // V1 API Namespace
-  const v1Router = express.Router();
+  const versionedRouter = express.Router();
 
-  // Escrow read — returns raw state enriched with derived display fields
-  v1Router.get('/escrow/:invoiceId', authenticateToken, async (req, res, next) => {
+  // Escrow routes in V1
+  versionedRouter.get('/escrow/:invoiceId', authenticateToken, async (req, res) => {
     const { invoiceId } = req.params;
     const currentLedger = parseLedgerSequence(req.headers['x-ledger-sequence']);
     try {
@@ -991,7 +1052,7 @@ function createApp(options = {}) {
   });
 
   // Versioned routes
-  app.use('/v1', v1Router);
+  app.use('/v1', versionedRouter);
 
 // if (enableTestRoutes) {
 //   app.get('/__test__/explode', () => {
@@ -1007,7 +1068,7 @@ if (enableTestRoutes) {
   app.get('/api/escrow/:invoiceId', (req, res, next) => {
     res.set('Warning', '299 - "This endpoint is deprecated. Use /v1/escrow instead."');
     next();
-  }, v1Router.stack.find(s => s.route && s.route.path === '/escrow/:invoiceId').handle);
+  }, versionedRouter.stack.find(s => s.route && s.route.path === '/escrow/:invoiceId').handle);
 
   app.post('/api/escrow/:invoiceId/fund', (req, res, next) => {
     next();
@@ -1131,12 +1192,22 @@ const appInstance = createApp({
   enableTestRoutes: process.env.NODE_ENV === 'test',
 });
 
+/**
+ * Starts the Express server.
+ *
+ * @returns {import('http').Server} The server instance.
+ */
 function startServer() {
   return appInstance.listen(PORT, () => {
     logger.warn(`API running at http://localhost:${PORT}`);
   });
 }
 
+/**
+ * Resets the in-memory invoice store.
+ *
+ * @returns {void}
+ */
 function resetStore() {
   invoices.length = 0;
 }
