@@ -66,6 +66,56 @@ const AppError = require('../errors/AppError');
  *       401:
  *         description: Unauthorized
  */
+/**
+ * @swagger
+ * /api/invest/list:
+ *   get:
+ *     summary: List investment opportunities (batched)
+ *     description: Retrieve a paginated list of opportunities with fresh on-chain data using cursor pagination.
+ *     tags: [Invest]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: cursor
+ *         schema:
+ *           type: string
+ *         description: Cursor for pagination (invoiceId from previous page)
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 10
+ *         description: Number of items to retrieve
+ *     responses:
+ *       200:
+ *         description: Success
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/list', authenticateToken, async (req, res, next) => {
+  try {
+    const { cursor, limit = 10 } = req.query;
+
+    const result = await investService.listInvestments({ cursor, limit });
+
+    logger.info({ 
+      requestId: req.id, 
+      count: result.data.length,
+      nextCursor: result.meta.next_cursor 
+    }, 'Retrieved batched investment list');
+
+    return res.json({
+      ...result,
+      message: 'Investment opportunities retrieved successfully with on-chain state.',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.get('/opportunities', authenticateToken, async (req, res, next) => {
   try {
     const { page = 1, limit = 10 } = req.query;

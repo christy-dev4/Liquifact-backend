@@ -121,6 +121,8 @@ Error: Mismatch: STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://sorob
 | `npm run lint` | Run ESLint on `src/` |
 | `npm test` | Run load helper tests and structured error tests |
 | `npm run db:migrate` | Run database migrations |
+| `npm run db:rollback` | Rollback last migration |
+| `npm run db:seed` | Run database seeds |
 | `npm run db:migrate:down` | Rollback last migration |
 | `npm run db:migrate:create <name>` | Create new migration file |
 | `npm run db:migrate:reset` | Reset database (drop & re-run) |
@@ -172,6 +174,7 @@ The API is documented using OpenAPI 3.0 specification.
 
 - **OpenAPI JSON**: `GET /openapi.json` - Machine-readable API specification
 - **Interactive Docs**: `GET /docs` - Swagger UI for exploring and testing the API
+- **Correlation Strategy**: See [`docs/invoice-correlation.md`](./docs/invoice-correlation.md) for details on how `invoiceId` correlates with on-chain Stellar and Soroban data.
 
 The documentation covers all public endpoints including health checks, invoice management, escrow operations, and investment opportunities.
 
@@ -189,7 +192,7 @@ Core routes currently covered:
 
 - Health: `GET /health`
 - API Info: `GET /api`
-- Invoices: `GET /api/invoices`, `GET /api/invoices/:id`, `POST /api/invoices`, `DELETE /api/invoices/:id`, `PATCH /api/invoices/:id/restore`
+- Invoices: `GET /api/invoices` (with optional status filter), `GET /api/invoices/:id`, `POST /api/invoices`
 - Escrow: `GET /api/escrow/:invoiceId`, `POST /api/escrow`
 - Investment: `GET /api/invest/opportunities`
 - SME Metrics: `GET /api/sme/metrics`
@@ -532,6 +535,48 @@ Unexpected error:
   }
 }
 ```
+
+---
+
+## Security audit log (Issue #116)
+
+The backend now supports a database-backed append-only audit log for:
+
+- admin actions (for example, KYC state transitions or key-rotation operations)
+- webhook dispatch outcomes (success/failure with redacted payload fields)
+
+### Database migrations
+
+Run SQL migrations in order:
+
+- `migrations/202604260001_create_audit_log_events.sql`
+- `migrations/202604260002_enforce_audit_log_append_only.sql`
+
+`audit_log_events` is enforced as append-only at the database layer via triggers that reject `UPDATE` and `DELETE`.
+
+### Runtime behavior
+
+- `src/middleware/auditLog.js` attaches `req.audit` helpers:
+  - `req.audit.logAdminAction(...)`
+  - `req.audit.logWebhookDelivery(...)`
+- successful `POST|PUT|PATCH|DELETE` requests under `/api/admin/*` are auto-logged
+- sensitive fields are redacted before persistence (`password`, `token`, `secret`, `apiKey`, `privateKey`, etc.)
+
+### Example API usage
+
+Admin action example:
+
+```bash
+curl -X POST http://localhost:3001/api/admin/kyc/cus_42/approve \
+  -H "Authorization: Bearer <admin-jwt>" \
+  -H "x-admin-action: kyc.approve" \
+  -H "x-audit-target-type: kyc_profile" \
+  -H "x-audit-target-id: cus_42" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"manual review","privateKey":"redacted-at-write-time"}'
+```
+
+Webhook delivery logging is typically called internally from delivery workers/routes via `req.audit.logWebhookDelivery(...)`.
 
 ---
 

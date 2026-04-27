@@ -55,7 +55,7 @@ function validateApiKey(apiKey) {
     const keyHash = hashApiKey(apiKey);
     db.get('SELECT * FROM api_keys WHERE key_hash = ? AND is_active = 1', [keyHash], (err, row) => {
       db.close();
-      if (err) return reject(err);
+      if (err) {return reject(err);}
       resolve(row);
     });
   });
@@ -83,18 +83,23 @@ function updateAudit(keyId, action) {
  * @param {object} req - Express request.
  * @param {object} res - Express response.
  * @param {function} next - Next middleware.
+ * @returns {Promise<void>}
  */
 async function apiKeyAuth(req, res, next) {
   const apiKey = req.headers['x-api-key'];
   if (!apiKey) {
-    return next(new AppError('Missing X-API-KEY header', 401));
+    const err = new Error('Missing X-API-KEY header');
+    err.status = 401;
+    return next(err);
   }
 
   try {
     const keyData = await validateApiKey(apiKey);
     if (!keyData) {
       logger.warn({ apiKeyHash: hashApiKey(apiKey) }, 'Invalid API key attempt');
-      return next(new AppError('Invalid API key', 401));
+      const err = new Error('Invalid API key');
+      err.status = 401;
+      return next(err);
     }
 
     req.apiKey = { id: keyData.id, name: keyData.name };
@@ -102,7 +107,9 @@ async function apiKeyAuth(req, res, next) {
     next();
   } catch (err) {
     logger.error(err, 'API key validation error');
-    next(new AppError('Authentication error', 500));
+    const e = new Error('Authentication error');
+    e.status = 500;
+    next(e);
   }
 }
 

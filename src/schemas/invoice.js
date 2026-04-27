@@ -26,22 +26,41 @@ const invoiceCreateSchema = z.object({
   amount: z.number()
     .positive({ message: 'Amount must be a positive number' })
     .finite({ message: 'Amount must be a finite number' }),
-  dueDate: dateSchema,
+  dueDate: dateSchema.optional(),
   buyer: z.string()
     .min(1, { message: 'Buyer is required' })
     .max(255, { message: 'Buyer name must not exceed 255 characters' })
-    .trim(),
+    .trim()
+    .optional(),
+  customer: z.string()
+    .min(1)
+    .max(255)
+    .trim()
+    .optional(),
   seller: z.string()
     .min(1, { message: 'Seller is required' })
     .max(255, { message: 'Seller name must not exceed 255 characters' })
-    .trim(),
-  currency: currencySchema,
+    .trim()
+    .optional(),
+  currency: currencySchema.optional(),
   description: z.string()
     .max(1000, { message: 'Description must not exceed 1000 characters' })
     .optional(),
   invoiceNumber: z.string()
     .max(100, { message: 'Invoice number must not exceed 100 characters' })
     .optional(),
+}).superRefine((data, ctx) => {
+  // Require either buyer or customer
+  if (!data.buyer && !data.customer) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Buyer is required', path: ['buyer'] });
+  }
+  // If buyer is explicitly provided as empty string, flag it
+  if (data.buyer !== undefined && data.buyer.trim() === '') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Buyer is required', path: ['buyer'] });
+  }
+  if (data.seller !== undefined && data.seller.trim() === '') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Seller is required', path: ['seller'] });
+  }
 });
 
 const paginationQuerySchema = z.object({
@@ -75,6 +94,11 @@ const paginationQuerySchema = z.object({
   }).optional(),
 });
 
+/**
+ * Parses Zod errors into a flatter field-mapped object.
+ * @param {import('zod').ZodError} zodError The Zod error object.
+ * @returns {Object} An object mapping field paths to error messages.
+ */
 function parseValidationErrors(zodError) {
   const fieldErrors = {};
   
@@ -90,6 +114,11 @@ function parseValidationErrors(zodError) {
   return fieldErrors;
 }
 
+/**
+ * Creates Express middleware to validate request body against a Zod schema.
+ * @param {import('zod').ZodSchema} schema The Zod schema to validate against.
+ * @returns {import('express').RequestHandler} Express middleware.
+ */
 function validateBody(schema) {
   return (req, res, next) => {
     try {
@@ -109,6 +138,11 @@ function validateBody(schema) {
   };
 }
 
+/**
+ * Creates Express middleware to validate request query parameters against a Zod schema.
+ * @param {import('zod').ZodSchema} schema The Zod schema to validate against.
+ * @returns {import('express').RequestHandler} Express middleware.
+ */
 function validateQuery(schema) {
   return (req, res, next) => {
     try {
