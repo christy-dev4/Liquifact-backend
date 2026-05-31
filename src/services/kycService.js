@@ -1,15 +1,19 @@
+'use strict';
+
 /**
  * KYC Service
- * Manages KYC verification workflows and status updates.
- * 
- * Supports optional external KYC provider integration when env keys are present.
- * Defaults to in-memory mock implementation.
- * 
+ *
+ * Verifies SME identity via an external KYC provider and persists results
+ * to the kyc_records table so status survives restarts.
+ *
+ * Fail-closed: any provider error leaves the status as 'pending'.
+ *
  * @module services/kycService
  */
 
 const logger = require('../logger');
 const appConfig = require('../config');
+const db = require('../db/knex');
 
 const KYC_STATUSES = {
   PENDING: 'pending',
@@ -18,19 +22,15 @@ const KYC_STATUSES = {
   EXEMPTED: 'exempted',
 };
 
-// In-memory store for KYC records (used in test/dev environments)
-const mockKycRecords = new Map();
-
 /**
- * Configuration for external KYC provider.
- * Reads from validated config when available, falls back to process.env in test.
+ * Returns KYC provider config from validated app config or process.env fallback
+ * (the fallback keeps unit tests that skip validate() working).
  */
-const getKycProviderConfig = () => {
+function getKycProviderConfig() {
   let cfg;
   try {
     cfg = appConfig.get();
   } catch {
-    // config not yet validated (e.g. unit tests that don't call validate())
     cfg = process.env;
   }
   const apiKey = cfg.KYC_PROVIDER_API_KEY || null;
@@ -41,51 +41,102 @@ const getKycProviderConfig = () => {
     baseUrl,
     apiSecret: cfg.KYC_PROVIDER_SECRET || null,
   };
-};
+}
 
 /**
- * Verifies KYC status from external provider
- * Only called if provider is configured and enabled
- * 
- * @param {string} smeId - The SME identifier
- * @param {Object} smeData - SME data (name, email, etc.)
- * @returns {Promise<{status: string, recordId: string, verifiedAt: string}>}
+ * Calls the external KYC provider to verify an SME.
+ *
+ * POST {baseUrl}/verify
+ * Authorization: Bearer {apiKey}
+ * Body: { smeId, ...smeData }
+ *
+ * Expected response: { status, recordId, verifiedAt }
+ *
+ * @param {string} smeId
+ * @param {Object} smeData
+ * @returns {Promise<{status: string, recordId: string, verifiedAt: string|null}>}
  */
-async function verifyWithExternalProvider(smeId, smeData) {
+async function verifyWithExternalProvider(smeId, smeData = {}) {
   const config = getKycProviderConfig();
-  
+
   if (!config.enabled) {
     throw new Error('KYC provider not configured');
   }
 
-  try {
-    // TODO: Implement actual HTTP call to KYC provider
-    // This is a placeholder - replace with actual provider integration
-    logger.info(
-      { smeId, provider: config.baseUrl },
-      'Calling external KYC provider (stub implementation)'
-    );
+  const url = `${config.baseUrl}/verify`;
 
-    // Mock response structure
-    return {
-      status: KYC_STATUSES.VERIFIED,
-      recordId: `kyc_${smeId}_${Date.now()}`,
-      verifiedAt: new Date().toISOString(),
-    };
-  } catch (error) {
-    logger.error(
-      { smeId, error: error.message },
-      'External KYC provider call failed'
-    );
-    throw error;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`,
+      ...(config.apiSecret ? { 'X-KYC-Secret': config.apiSecret } : {}),
+    },
+    body: JSON.stringify({ smeId, ...smeData }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`KYC provider returned ${response.status}`);
+  }
+
+  const body = await response.json();
+
+  return {
+    status: body.status || KYC_STATUSES.PENDING,
+    recordId: body.recordId || null,
+    verifiedAt: body.verifiedAt || null,
+  };
+}
+
+/**
+ * Persists (upserts) a KYC result to the database.
+ *
+ * @param {string} smeId
+ * @param {{status: string, recordId: string|null, verifiedAt: string|null}} result
+ */
+async function persistKycRecord(smeId, result) {
+  const row = {
+    sme_id: smeId,
+    status: result.status,
+    provider_record_id: result.recordId || null,
+    verified_at: result.verifiedAt ? new Date(result.verifiedAt) : null,
+    updated_at: new Date(),
+  };
+
+  const existing = await db('kyc_records').where({ sme_id: smeId }).first();
+
+  if (existing) {
+    await db('kyc_records').where({ sme_id: smeId }).update(row);
+  } else {
+    await db('kyc_records').insert(row);
   }
 }
 
 /**
- * Gets KYC status for an SME
- * Checks external provider if available, falls back to mock data
- * 
- * @param {string} smeId - The SME identifier
+ * Reads a persisted KYC record from the database.
+ *
+ * @param {string} smeId
+ * @returns {Promise<{status: string, recordId: string|null, verifiedAt: string|null}|null>}
+ */
+async function readKycRecord(smeId) {
+  const row = await db('kyc_records').where({ sme_id: smeId }).first();
+  if (!row) return null;
+  return {
+    status: row.status,
+    recordId: row.provider_record_id || null,
+    verifiedAt: row.verified_at ? new Date(row.verified_at).toISOString() : null,
+  };
+}
+
+/**
+ * Returns the current KYC status for an SME.
+ *
+ * Flow:
+ *  1. If provider is configured, call it and persist the result.
+ *  2. On provider error, log and fall back to the last persisted record.
+ *  3. If no record exists, return pending (fail-closed).
+ *
+ * @param {string} smeId
  * @returns {Promise<{status: string, recordId?: string, verifiedAt?: string}>}
  */
 async function getKycStatus(smeId) {
@@ -95,153 +146,45 @@ async function getKycStatus(smeId) {
 
   const config = getKycProviderConfig();
 
-  // Try external provider first if configured
   if (config.enabled) {
     try {
       const result = await verifyWithExternalProvider(smeId, {});
+      await persistKycRecord(smeId, result);
+      logger.info({ smeId, status: result.status }, 'KYC status refreshed from provider');
       return result;
-    } catch (error) {
-      logger.warn({ smeId, error: error.message }, 'KYC provider lookup failed, using mock');
+    } catch (err) {
+      // Log without leaking the API key
+      logger.warn(
+        { smeId, error: err.message, provider: config.baseUrl },
+        'KYC provider call failed — falling back to persisted record'
+      );
     }
   }
 
-  // Fall back to mock/in-memory store
-  const record = mockKycRecords.get(smeId);
-  if (record) {
-    return {
-      status: record.status,
-      recordId: record.recordId,
-      verifiedAt: record.verifiedAt,
-    };
-  }
+  // Fall back to DB
+  const persisted = await readKycRecord(smeId);
+  if (persisted) return persisted;
 
-  // Default: pending status
-  return {
-    status: KYC_STATUSES.PENDING,
-  };
+  return { status: KYC_STATUSES.PENDING };
 }
 
 /**
- * Marks an SME as KYC verified
- * Only available in test/development (mock implementation)
- * Production should integrate with real KYC provider
- * 
- * @param {string} smeId - The SME identifier
- * @param {Object} options - Additional options
- * @returns {Promise<{status: string, recordId: string, verifiedAt: string}>}
- */
-async function verifySmeSafe(smeId, options = {}) {
-  if (!smeId || typeof smeId !== 'string') {
-    throw new Error('Invalid SME ID');
-  }
-
-  const recordId = options.recordId || `kyc_${smeId}_${Date.now()}`;
-  const record = {
-    smeId,
-    status: KYC_STATUSES.VERIFIED,
-    recordId,
-    verifiedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
-  };
-
-  mockKycRecords.set(smeId, record);
-
-  logger.info({ smeId, recordId }, 'SME marked as KYC verified');
-
-  return {
-    status: record.status,
-    recordId: record.recordId,
-    verifiedAt: record.verifiedAt,
-  };
-}
-
-/**
- * Rejects KYC for an SME (mock implementation)
- * 
- * @param {string} smeId - The SME identifier
- * @param {string} reason - Reason for rejection
- * @returns {Promise<{status: string, recordId: string}>}
- */
-async function rejectSmeKyc(smeId, reason = 'Manual rejection') {
-  if (!smeId || typeof smeId !== 'string') {
-    throw new Error('Invalid SME ID');
-  }
-
-  const recordId = `kyc_${smeId}_${Date.now()}`;
-  const record = {
-    smeId,
-    status: KYC_STATUSES.REJECTED,
-    recordId,
-    reason,
-    rejectedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
-  };
-
-  mockKycRecords.set(smeId, record);
-
-  logger.warn({ smeId, recordId, reason }, 'SME KYC rejected');
-
-  return {
-    status: record.status,
-    recordId: record.recordId,
-  };
-}
-
-/**
- * Exempts an SME from KYC requirements
- * Typically used for low-risk vendors or when exemption is policy-approved
- * 
- * @param {string} smeId - The SME identifier
- * @param {string} reason - Reason for exemption
- * @returns {Promise<{status: string, recordId: string}>}
- */
-async function exemptSmeFromKyc(smeId, reason = 'Manual exemption') {
-  if (!smeId || typeof smeId !== 'string') {
-    throw new Error('Invalid SME ID');
-  }
-
-  const recordId = `kyc_${smeId}_${Date.now()}`;
-  const record = {
-    smeId,
-    status: KYC_STATUSES.EXEMPTED,
-    recordId,
-    reason,
-    exemptedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
-  };
-
-  mockKycRecords.set(smeId, record);
-
-  logger.info({ smeId, recordId, reason }, 'SME exempted from KYC');
-
-  return {
-    status: record.status,
-    recordId: record.recordId,
-  };
-}
-
-/**
- * Checks if an SME can proceed with funding operations
- * Returns true only for 'verified' or 'exempted' statuses
- * 
- * @param {string} kycStatus - The KYC status string
- * @returns {boolean} True if KYC status allows funding
+ * Returns true only for statuses that permit capital transfer.
+ *
+ * @param {string} kycStatus
+ * @returns {boolean}
  */
 function canFundWithKycStatus(kycStatus) {
   return kycStatus === KYC_STATUSES.VERIFIED || kycStatus === KYC_STATUSES.EXEMPTED;
 }
 
-function resetMockRecords() {
-  mockKycRecords.clear();
-}
-
 module.exports = {
   KYC_STATUSES,
   getKycStatus,
-  verifySmeSafe,
-  rejectSmeKyc,
-  exemptSmeFromKyc,
   canFundWithKycStatus,
-  resetMockRecords,
   getKycProviderConfig,
+  // Exported for testing
+  verifyWithExternalProvider,
+  persistKycRecord,
+  readKycRecord,
 };

@@ -1,7 +1,6 @@
 'use strict';
 
 const crypto = require('crypto');
-const axios = require('axios');
 const db = require('../db/knex');
 const logger = require('../logger');
 
@@ -92,8 +91,28 @@ async function emitWebhook(event, invoiceId, additionalData = {}) {
       ...additionalData,
     });
 
-    const rawBody = JSON.stringify(payload);
-    const signatureHeader = createSignatureHeader(webhook_secret, rawBody);
+    // Sign payload
+    const body = JSON.stringify(payload);
+    const signature = crypto.createHmac('sha256', webhook_secret).update(body).digest('hex');
+
+    // Send webhook with native fetch and 5s timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    let response;
+    try {
+      response = await fetch(webhook_url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Signature': signature,
+        },
+        body,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     await axios.post(webhook_url, rawBody, {
       headers: {
