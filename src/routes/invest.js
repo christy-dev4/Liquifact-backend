@@ -7,6 +7,7 @@
  */
 
 const express = require('express');
+const idempotencyMiddleware = require('../middleware/idempotency');
 const router = express.Router();
 const investService = require('../services/investService');
 const { authenticateToken } = require('../middleware/auth');
@@ -172,6 +173,7 @@ router.get('/opportunities', async (req, res, next) => {
  */
 router.post(
   '/fund-invoice',
+  idempotencyMiddleware,
   requireKycForFunding,
   async (req, res, next) => {
     try {
