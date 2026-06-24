@@ -1,6 +1,6 @@
 'use strict';
 
-const { Readable, Transform } = require('stream');
+const { Transform } = require('stream');
 const db = require('../db/knex');
 
 const REDACTED = '***REDACTED***';
@@ -15,6 +15,12 @@ const SENSITIVE_KEY_PATTERNS = [
   /mnemonic/i,
 ];
 
+/**
+ * Redacts sensitive values from an object.
+ *
+ * @param {*} value The value to redact.
+ * @returns {*} The redacted value.
+ */
 function redactValue(value) {
   if (value === null || value === undefined) {
     return value;
@@ -39,6 +45,12 @@ function redactValue(value) {
   return sanitized;
 }
 
+/**
+ * Normalizes metadata for storage.
+ *
+ * @param {*} metadata The metadata object to normalize.
+ * @returns {object} The normalized metadata object.
+ */
 function normalizeMetadata(metadata) {
   if (!metadata || typeof metadata !== 'object') {
     return {};
@@ -46,6 +58,14 @@ function normalizeMetadata(metadata) {
   return redactValue(metadata);
 }
 
+/**
+ * Appends an audit log event to the database.
+ *
+ * @param {object} event The event to append.
+ * @param {object} [options={}] Additional options.
+ * @param {object} [options.db] Alternative Knex instance.
+ * @returns {Promise<void>} Resolves when the event is inserted.
+ */
 async function appendAuditEvent(event, options = {}) {
   const knex = options.db || db;
   const record = {
@@ -189,6 +209,8 @@ function createCsvTransform() {
   return new Transform({
     objectMode: true,
     /**
+     * Transforms a raw DB row to CSV line.
+     *
      * @param {object}   row      Raw DB row in object mode.
      * @param {string}   _enc     Ignored (objectMode).
      * @param {Function} callback Node stream callback.
