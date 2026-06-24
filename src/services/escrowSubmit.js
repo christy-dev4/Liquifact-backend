@@ -43,6 +43,8 @@ const SIGNING_MODE = {
   STUBBED: 'stubbed',
 };
 
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+
 /**
  * @typedef {Object} EscrowSubmitResult
  * @property {'requires_signature'|'submitted'|'stubbed'} status
@@ -193,4 +195,5 @@ module.exports = {
   submitFundEscrow,
   EscrowSubmitError,
   SIGNING_MODE,
+  IDEMPOTENCY_KEY_PATTERN,
 };
