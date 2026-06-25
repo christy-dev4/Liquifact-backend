@@ -129,10 +129,10 @@ function computeFundedPercent(fundedAmount, totalAmount) {
  * @returns {number|null} Null when maturityDate is absent or unparseable.
  */
 function computeDaysToMaturity(maturityDate, opts = {}) {
-  if (maturityDate == null) return null;
+  if (maturityDate == null) { return null; }
   const maturity =
     maturityDate instanceof Date ? maturityDate : new Date(maturityDate);
-  if (isNaN(maturity.getTime())) return null;
+  if (isNaN(maturity.getTime())) { return null; }
 
   // Support legacy callers that pass a Date directly as the second argument.
   const resolvedOpts = opts instanceof Date ? { now: opts } : opts;
