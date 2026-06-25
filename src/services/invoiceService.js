@@ -13,6 +13,8 @@
  *   createInvoice(data, tenantId)         — insert with generated invoice_id
  *   updateInvoice(id, updates, tenantId)  — tenant-scoped UPDATE
  *   deleteInvoice(id, tenantId)           — soft-delete
+ *   resolveInvoiceForTenant(id, tenantId) — tenant-scoped lookup for state routes
+ *   transitionInvoice(id, target, tenantId, opts) — execute + persist transition
  *
  * KYC helpers (in-memory mockInvoices — retained for test compatibility):
  *   getInvoicesByKycStatus(userId, kycStatus)
@@ -26,6 +28,7 @@
 const db = require('../db/knex');
 const { applyQueryOptions } = require('../utils/queryBuilder');
 const logger = require('../logger');
+const { executeTransition } = require('./invoiceStateMachine');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -302,6 +305,108 @@ async function deleteInvoice(id, tenantId) {
   return db('invoices').where({ invoice_id: id, tenant_id: tenantId }).first();
 }
 
+/**
+ * Parses invoice metadata from a DB row (JSON string or object) into a plain object.
+ *
+ * @param {string|object|null|undefined} raw - Raw metadata column value.
+ * @returns {object} Parsed metadata object (empty when absent or invalid).
+ */
+function parseInvoiceMetadata(raw) {
+  if (!raw) {
+    return {};
+  }
+  if (typeof raw === 'object') {
+    return { ...raw };
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Resolves an invoice for the authenticated tenant.
+ * Returns null when the invoice does not exist, is soft-deleted, or belongs to
+ * another tenant — callers should respond with 404 without leaking existence.
+ *
+ * @param {string} invoiceId - Public invoice_id (e.g. "inv-001").
+ * @param {string} tenantId  - Tenant identifier from extractTenant middleware.
+ * @returns {Promise<object|null>} Invoice row or null.
+ * @throws {TypeError} When tenantId is missing.
+ */
+async function resolveInvoiceForTenant(invoiceId, tenantId) {
+  if (!tenantId) {
+    throw new TypeError('tenantId is required');
+  }
+  return module.exports.getInvoiceById(invoiceId, tenantId);
+}
+
+/**
+ * Executes a validated state transition via the invoice state machine and
+ * persists the resulting status to the database. Status is always derived from
+ * the state machine result — client-supplied status fields are never written.
+ *
+ * Optionally merges `escrowId` into the invoice metadata when linking escrow.
+ *
+ * @param {string} invoiceId   - Public invoice_id.
+ * @param {string} targetState - Desired lifecycle state from the state machine.
+ * @param {string} tenantId    - Tenant identifier.
+ * @param {object} [options={}] - Transition context.
+ * @param {string} options.actor - Actor performing the transition.
+ * @param {string} [options.reason] - Human-readable reason (required for terminal targets).
+ * @param {string} [options.ipAddress] - Request source IP.
+ * @param {string} [options.userAgent] - Request user agent.
+ * @param {object} [options.metadata] - Additional audit metadata.
+ * @param {string|null|undefined} [options.escrowId] - Escrow contract ID to persist in metadata.
+ * @returns {Promise<object>} State-machine transition result (previousState, newState, auditLog, …).
+ * @throws {Error} With `.code` / `.allowedTransitions` when validation fails.
+ * @throws {Error} With `.code = 'INVOICE_NOT_FOUND'` and `.statusCode = 404` when not found.
+ */
+async function transitionInvoice(invoiceId, targetState, tenantId, options = {}) {
+  const invoice = await module.exports.resolveInvoiceForTenant(invoiceId, tenantId);
+  if (!invoice) {
+    const err = new Error('Invoice not found');
+    err.code = 'INVOICE_NOT_FOUND';
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const {
+    actor,
+    reason,
+    ipAddress = 'unknown',
+    userAgent = 'unknown',
+    metadata = {},
+    escrowId,
+  } = options;
+
+  const result = await executeTransition({
+    invoiceId,
+    currentState: invoice.status,
+    targetState,
+    actor,
+    reason,
+    ipAddress,
+    userAgent,
+    metadata,
+  });
+
+  const updates = { status: result.newState };
+
+  if (escrowId !== undefined) {
+    const meta = parseInvoiceMetadata(invoice.metadata);
+    if (escrowId) {
+      meta.escrowId = escrowId;
+    }
+    updates.metadata = JSON.stringify(meta);
+  }
+
+  await module.exports.updateInvoice(invoiceId, updates, tenantId);
+
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // KYC helpers (in-memory — retained for backward compat with existing tests)
 // ---------------------------------------------------------------------------
@@ -369,6 +474,9 @@ module.exports = {
   createInvoice,
   updateInvoice,
   deleteInvoice,
+  resolveInvoiceForTenant,
+  transitionInvoice,
+  parseInvoiceMetadata,
   // KYC helpers (in-memory)
   getInvoicesByKycStatus,
   updateInvoiceKycStatus,
