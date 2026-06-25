@@ -16,6 +16,9 @@ const ConfigSchema = z
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
     PORT: z.coerce.number().min(1).max(65535).default(3001),
     JWT_SECRET: z.string().min(32), // No default for security
+    JWT_ISSUER: z.string().min(1).default('liquifact-platform'),
+    JWT_AUDIENCE: z.string().min(1).default('liquifact-client'),
+    JWT_ALGORITHMS: z.string().default('HS256'),
     CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
     NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),

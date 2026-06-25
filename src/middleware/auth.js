@@ -6,6 +6,7 @@
 
 const jwt = require('jsonwebtoken');
 const AppError = require('../errors/AppError');
+const configModule = require('../config');
 
 /**
  * Middleware function to enforce authentication for protected routes.
@@ -43,9 +44,28 @@ const authenticateToken = (req, res, next) => {
   }
 
   const token = tokenParts[1];
-  const secret = process.env.JWT_SECRET || 'test-secret'; // Fallback for local testing if env is not completely set
+  
+  let config;
+  try {
+    config = configModule.get();
+  } catch (err) {
+    config = {
+      JWT_SECRET: process.env.JWT_SECRET || 'test-secret',
+      JWT_ISSUER: process.env.JWT_ISSUER || 'liquifact-platform',
+      JWT_AUDIENCE: process.env.JWT_AUDIENCE || 'liquifact-client',
+      JWT_ALGORITHMS: process.env.JWT_ALGORITHMS || 'HS256',
+    };
+  }
 
-  jwt.verify(token, secret, (err, decoded) => {
+  const secret = config.JWT_SECRET;
+  const algorithms = config.JWT_ALGORITHMS ? config.JWT_ALGORITHMS.split(',').map(s => s.trim()) : ['HS256'];
+  const options = {
+    algorithms,
+    issuer: config.JWT_ISSUER,
+    audience: config.JWT_AUDIENCE,
+  };
+
+  jwt.verify(token, secret, options, (err, decoded) => {
     if (err) {
       if (err.name === 'TokenExpiredError') {
         return next(new AppError({
