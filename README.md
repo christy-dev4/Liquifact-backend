@@ -87,51 +87,22 @@ Do not store secrets in source control. Use `.env` locally and deployment secret
 
 ---
 
-## CORS Configuration
+## KYC Provider Integration
 
-The API enforces a strict CORS policy via the `src/config/cors.js` module. The allowlist
-is built from the `CORS_ORIGINS` environment variable (comma-separated list of exact origins;
-`CORS_ALLOWED_ORIGINS` is also accepted for backward compatibility).
+This backend supports an optional external KYC provider adapter. When `KYC_PROVIDER_URL` and `KYC_PROVIDER_API_KEY` are both configured, the service submits verification requests to the provider and maps provider statuses onto internal `KYC_STATUSES`:
 
-### Exact-match semantics
+- `pending`
+- `verified`
+- `rejected`
+- `exempted`
 
-Only origins that appear verbatim in the configured list are permitted. **Wildcard patterns
-(`*`) are never used** — every origin is checked for an exact match against the allowlist.
-Requests without an `Origin` header (e.g. curl, server-to-server) are always passed through.
+Incoming provider status updates are ingested through a signed webhook endpoint:
 
-### Environment-aware defaults
+- `POST /api/kyc/webhook`
 
-| Condition | Behaviour |
-|-----------|-----------|
-| `NODE_ENV=development` and no `CORS_ORIGINS` set | A hard-coded set of localhost origins is allowed (`http://localhost:3000`, `http://localhost:3001`, `http://localhost:5173`, `http://127.0.0.1:3000`, `http://127.0.0.1:5173`) |
-| `NODE_ENV=production` and no `CORS_ORIGINS` set | Every browser origin is denied — the server returns 403 for any `Origin` header |
-| `CORS_ORIGINS` set (any environment) | Only the explicitly listed origins are allowed |
+The webhook verifies the `X-Signature` HMAC signature using `KYC_PROVIDER_SECRET` before persisting the SME record.
 
-### Preflight caching (`CORS_MAX_AGE`)
-
-The `Access-Control-Max-Age` response header on preflight (`OPTIONS`) requests is
-configurable via the `CORS_MAX_AGE` environment variable (value in seconds).
-
-- **Default**: `600` (10 minutes)
-- If unset, empty, or not a valid positive integer, the default is used.
-
-### Hot-reloadable allowlist
-
-The `reloadCorsOrigins()` function (exported from `src/config/cors.js`) re-reads
-`CORS_ORIGINS` from `process.env` and replaces the internal allowlist **without
-restarting the server**. Already-connected CORS middleware instances reflect the
-new origins immediately for subsequent requests.
-
-This function can be wired into an admin endpoint (e.g. `POST /api/admin/cors/reload`)
-or a config-file watcher. The reload mechanism itself is intentionally outside the
-scope of this module — `reloadCorsOrigins()` provides the primitive for whichever
-orchestration layer you choose.
-
-### Disallowed-origin errors
-
-Blocked origins receive a 403 Forbidden response with a dedicated `Error` object
-whose `.isCorsOriginRejected` flag is `true`. Downstream error handlers can use the
-`isCorsOriginRejectedError()` helper exported from the module to detect this case.
+When no provider keys are present, the service gracefully falls back to the in-memory mock provider behavior used for local development and tests.
 
 ---
 
