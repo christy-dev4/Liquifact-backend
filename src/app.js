@@ -324,6 +324,7 @@ function createApp() {
   app.use('/api/retention', retentionRoutes);
   app.use('/api/admin/audit', auditTrailRoutes);
   app.use('/api/admin/escrow', adminEscrowRoutes);
+  app.use('/api/investor', investorRoutes);
   app.use('/v1', v1Routes);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
