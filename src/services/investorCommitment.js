@@ -1,178 +1,365 @@
+/**
+ * src/services/investorCommitment.js
+ *
+ * Persists investor commitment records produced by the fund-invoice flow.
+ * Uses Knex (the project's existing query builder) so the implementation works
+ * with both PostgreSQL (production) and SQLite (test/CI).
+ *
+ * Table: investor_commitments
+ * Schema is created by migration: migrations/YYYYMMDDHHII_create_investor_commitments.js
+ *
+ * Idempotency: callers may supply an idempotencyKey (e.g. sha256 of
+ * investor + invoiceId + amount). Duplicate submissions with the same key
+ * return the existing row rather than inserting a second one.
+ */
+
 'use strict';
 
+const db = require('../db/knex');
+
+const TABLE = 'investor_commitments';
+
+// Stellar public key: G or C followed by exactly 55 base-32 characters (A-Z2-7)
+const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
+
+// Sane upper bound: 10^18 stroops (≈ 10 billion XLM — exceeds total supply)
+const MAX_STROOP_AMOUNT = 10n ** 18n;
+
 /**
- * Investor Commitment Service
- * Manages investor commitment data including claimNotBefore and effective yield
- * from the DB mirror (with stale flag for non-indexed data).
- *
- * @module services/investorCommitment
+ * Typed error thrown when commitment input fails validation.
+ * Callers can use `instanceof CommitmentValidationError` to distinguish
+ * domain errors from unexpected runtime failures.
  */
-
-const logger = require('../logger');
+class CommitmentValidationError extends Error {
+  /**
+   * Constructs a CommitmentValidationError.
+   * @param {string} message - Human-readable description.
+   * @param {string} code    - Machine-readable error code.
+   */
+  constructor(message, code) {
+    super(message);
+    this.name = 'CommitmentValidationError';
+    this.code = code;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
 
 /**
- * Validates a Stellar/Soroban address (G... or C... prefix).
+ * Validate that a value is a safe positive integer string suitable for
+ * on-chain stroop math.
  *
- * @param {unknown} address - Address to validate.
- * @returns {{ valid: boolean, reason?: string }}
+ * Rules:
+ *  - Must be a `string` (never coerced — callers must convert first)
+ *  - Must contain only ASCII decimal digits (no sign, no decimal point,
+ *    no scientific notation, no whitespace)
+ *  - Must not have leading zeros (e.g. "007" is rejected)
+ *  - Must be strictly positive (> 0)
+ *  - Must not exceed MAX_STROOP_AMOUNT (10^18 stroops ≈ 10 billion XLM)
+ *
+ * @param {unknown} value - The candidate amount value.
+ * @throws {CommitmentValidationError} When the value is not a valid stroop amount.
+ */
+function validateAmountStroops(value) {
+  if (typeof value !== 'string') {
+    throw new CommitmentValidationError(
+      `amountStroops must be a string, got ${typeof value}`,
+      'INVALID_AMOUNT_TYPE'
+    );
+  }
+
+  if (!/^\d+$/.test(value)) {
+    throw new CommitmentValidationError(
+      'amountStroops must contain only decimal digits (no sign, decimals, or spaces)',
+      'INVALID_AMOUNT_FORMAT'
+    );
+  }
+
+  // Reject leading zeros ("007", "00") but allow "0" itself for the zero check below
+  if (value.length > 1 && value[0] === '0') {
+    throw new CommitmentValidationError(
+      'amountStroops must not have leading zeros',
+      'INVALID_AMOUNT_FORMAT'
+    );
+  }
+
+  const big = BigInt(value);
+
+  if (big <= 0n) {
+    throw new CommitmentValidationError(
+      'amountStroops must be a positive integer (> 0)',
+      'INVALID_AMOUNT_RANGE'
+    );
+  }
+
+  if (big > MAX_STROOP_AMOUNT) {
+    throw new CommitmentValidationError(
+      `amountStroops exceeds maximum allowed value (${MAX_STROOP_AMOUNT.toString()})`,
+      'INVALID_AMOUNT_OVERFLOW'
+    );
+  }
+}
+
+/**
+ * Validate a Stellar public key (G... or C..., 56 characters total).
+ *
+ * @param {string} address - The candidate Stellar address.
+ * @returns {{ valid: boolean, reason: string }} Result object.
  */
 function validateAddress(address) {
-  if (typeof address !== 'string' || address.trim() === '') {
-    return { valid: false, reason: 'address must be a non-empty string' };
+  if (!address || typeof address !== 'string') {
+    return { valid: false, reason: 'invalid Stellar address: must be a non-empty string' };
   }
-  const trimmed = address.trim();
-  if (!/^[GC][A-Z0-9]{55}$/.test(trimmed)) {
+  if (!STELLAR_ADDRESS_RE.test(address)) {
     return {
       valid: false,
-      reason: 'invalid Stellar address format (expected G... or C... with 56 chars)',
+      reason: 'invalid Stellar address: must start with G or C and be 56 base-32 characters',
     };
   }
-  return { valid: true };
+  return { valid: true, reason: '' };
 }
 
 /**
- * @typedef {Object} InvestorLock
- * @property {string} funderAddress - Stellar address of the funder.
- * @property {string} claimNotBefore - ISO timestamp when claims become valid.
- * @property {number} investorEffectiveYieldBps - Effective yield in basis points.
- * @property {string} invoiceId - Associated invoice ID.
- * @property {boolean} stale - Whether data is from DB mirror (not live on-chain).
+ * @typedef {Object} CommitmentRecord
+ * @property {string}  id
+ * @property {string}  invoice_id
+ * @property {string}  investor_address
+ * @property {string}  escrow_address
+ * @property {string}  amount_stroops      — integer string
+ * @property {'requires_signature'|'submitted'|'stubbed'} status
+ * @property {string|null} unsigned_xdr
+ * @property {string|null} tx_hash
+ * @property {string|null} ledger
+ * @property {string|null} idempotency_key
+ * @property {Date}    created_at
+ * @property {Date}    updated_at
  */
 
 /**
- * In-memory store for investor locks (DB mirror placeholder).
- * In production, this would be synced from on-chain events.
+ * Persist a new commitment, or return the existing one when the idempotency
+ * key matches a prior row.
  *
- * @type {InvestorLock[]}
+ * @param {Object} params
+ * @param {string} params.invoiceId
+ * @param {string} params.investorAddress
+ * @param {string} params.escrowAddress
+ * @param {string} params.amountStroops   — must be a valid positive integer string
+ * @param {'requires_signature'|'submitted'|'stubbed'} params.status
+ * @param {string|null} [params.unsignedXdr]
+ * @param {string|null} [params.txHash]
+ * @param {string|null} [params.ledger]
+ * @param {string|null} [params.idempotencyKey]
+ * @returns {Promise<CommitmentRecord>}
+ * @throws {CommitmentValidationError} When inputs fail validation.
  */
-const investorLocks = [];
+async function persistCommitment({
+  invoiceId,
+  investorAddress,
+  escrowAddress,
+  amountStroops,
+  status,
+  unsignedXdr = null,
+  txHash = null,
+  ledger = null,
+  idempotencyKey = null,
+}) {
+  // Validate amount — throws CommitmentValidationError for any invalid format
+  validateAmountStroops(amountStroops);
+
+  // Validate investor address
+  const addrResult = validateAddress(investorAddress);
+  if (!addrResult.valid) {
+    throw new CommitmentValidationError(addrResult.reason, 'INVALID_INVESTOR_ADDRESS');
+  }
+
+  // Idempotency check: return early if we've already processed this exact request
+  if (idempotencyKey) {
+    const existing = await db(TABLE).where({ idempotency_key: idempotencyKey }).first();
+    if (existing) {
+      return existing;
+    }
+  }
+
+  const [row] = await db(TABLE)
+    .insert({
+      invoice_id: invoiceId,
+      investor_address: investorAddress,
+      escrow_address: escrowAddress,
+      amount_stroops: amountStroops,
+      status,
+      unsigned_xdr: unsignedXdr,
+      tx_hash: txHash,
+      ledger,
+      idempotency_key: idempotencyKey,
+    })
+    .returning('*');
+
+  return row;
+}
 
 /**
- * Adds or updates an investor lock record.
+ * Update the status of an existing commitment (e.g. once the investor submits
+ * the signed XDR and we observe the ledger result).
  *
- * @param {Object} params - Lock parameters.
- * @param {string} params.funderAddress - Stellar address of the funder.
- * @param {string} params.claimNotBefore - ISO timestamp for claim start.
- * @param {number} params.investorEffectiveYieldBps - Effective yield in bps.
- * @param {string} params.invoiceId - Associated invoice ID.
- * @returns {InvestorLock} The created/updated lock record.
+ * amount_stroops is immutable after creation — passing it in fields violates
+ * idempotency and is rejected with a typed error.
+ *
+ * @param {string} id        — commitment UUID
+ * @param {Partial<CommitmentRecord>} fields
+ * @returns {Promise<CommitmentRecord>}
+ * @throws {CommitmentValidationError} When fields attempts to change amount_stroops.
+ */
+async function updateCommitment(id, fields) {
+  if ('amount_stroops' in fields || 'amountStroops' in fields) {
+    throw new CommitmentValidationError(
+      'amount_stroops is immutable after commitment creation and cannot be updated',
+      'AMOUNT_IMMUTABLE'
+    );
+  }
+
+  const [row] = await db(TABLE)
+    .where({ id })
+    .update({ ...fields, updated_at: db.fn.now() })
+    .returning('*');
+  if (!row) {
+    throw new Error(`Commitment not found: ${id}`);
+  }
+  return row;
+}
+
+  /**
+   * Find commitments for a given investor and invoice.
+   *
+   * @param {string} investorAddress
+   * @param {string} invoiceId
+   * @returns {Promise<CommitmentRecord[]>}
+   */
+  async function findCommitments(investorAddress, invoiceId) {
+    return db(TABLE).where({ investor_address: investorAddress, invoice_id: invoiceId }).orderBy('created_at', 'desc');
+  }
+
+// ── In-memory investor lock store ─────────────────────────────────────────────
+// Keys are "${invoiceId}:${funderAddress}" for O(1) lookup.
+
+/** @type {Map<string, Object>} */
+const _lockStore = new Map();
+
+/**
+ * Upsert a lock record into the in-memory store.
+ *
+ * @param {Object} params
+ * @param {string} params.funderAddress
+ * @param {string} params.claimNotBefore
+ * @param {number} params.investorEffectiveYieldBps
+ * @param {string} params.invoiceId
+ * @returns {Object} The stored lock record.
  */
 function setInvestorLock({ funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId }) {
-  const existingIndex = investorLocks.findIndex(
-    (lock) => lock.funderAddress === funderAddress && lock.invoiceId === invoiceId
-  );
-
-  const lock = {
-    funderAddress,
-    claimNotBefore,
-    investorEffectiveYieldBps,
-    invoiceId,
-    stale: true,
-    updatedAt: new Date().toISOString(),
-  };
-
-  if (existingIndex >= 0) {
-    investorLocks[existingIndex] = lock;
-  } else {
-    investorLocks.push(lock);
-  }
-
-  logger.info({ funderAddress, invoiceId }, 'Investor lock updated (stale=true)');
-
-  return lock;
+  const key = `${invoiceId}:${funderAddress}`;
+  const record = { funderAddress, claimNotBefore, investorEffectiveYieldBps, invoiceId, stale: true };
+  _lockStore.set(key, record);
+  return record;
 }
 
 /**
- * Retrieves investor locks for a specific funder address.
+ * Retrieve a single lock by invoiceId and funderAddress.
  *
- * @param {string} funderAddress - Stellar address to query.
- * @param {Object} [options={}] - Query options.
- * @param {string} [options.invoiceId] - Optional filter by invoice ID.
- * @returns {InvestorLock[]} Array of matching lock records.
- */
-function getInvestorLocksByAddress(funderAddress, options = {}) {
-  const { invoiceId } = options;
-
-  let locks = investorLocks.filter((lock) => lock.funderAddress === funderAddress);
-
-  if (invoiceId) {
-    locks = locks.filter((lock) => lock.invoiceId === invoiceId);
-  }
-
-  return locks;
-}
-
-/**
- * Retrieves all investor locks, optionally filtered by invoice.
- *
- * @param {Object} [options={}] - Query options.
- * @param {string} [options.invoiceId] - Optional filter by invoice ID.
- * @returns {InvestorLock[]} Array of lock records.
- */
-function getAllInvestorLocks(options = {}) {
-  const { invoiceId } = options;
-
-  if (invoiceId) {
-    return investorLocks.filter((lock) => lock.invoiceId === invoiceId);
-  }
-
-  return [...investorLocks];
-}
-
-/**
- * Retrieves an investor lock by invoice ID and funder.
- *
- * @param {string} invoiceId - Invoice identifier.
- * @param {string} funderAddress - Funder Stellar address.
- * @returns {InvestorLock|undefined} The lock record if found.
+ * @param {string} invoiceId
+ * @param {string} funderAddress
+ * @returns {Object|undefined}
  */
 function getInvestorLock(invoiceId, funderAddress) {
-  return investorLocks.find(
-    (lock) => lock.invoiceId === invoiceId && lock.funderAddress === funderAddress
-  );
+  return _lockStore.get(`${invoiceId}:${funderAddress}`);
 }
 
 /**
- * Clears all investor locks (for testing).
+ * Returns all locks, optionally filtered by invoiceId, with offset pagination.
  *
- * @returns {void}
+ * @param {Object} [opts]
+ * @param {string} [opts.invoiceId]  - Optional invoiceId filter.
+ * @param {number} [opts.limit=20]   - Page size (1–100).
+ * @param {number} [opts.page=1]     - 1-based page number.
+ * @returns {{ data: Object[], meta: { total: number, page: number, limit: number, totalPages: number, hasMore: boolean } }}
  */
+function getAllInvestorLocks({ invoiceId, limit = 20, page = 1 } = {}) {
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const safePage = Math.max(1, page);
+  let items = [..._lockStore.values()];
+  if (invoiceId) {
+    items = items.filter((l) => l.invoiceId === invoiceId);
+  }
+  const total = items.length;
+  const offset = (safePage - 1) * safeLimit;
+  const data = items.slice(offset, offset + safeLimit);
+  return {
+    data,
+    meta: {
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit) || 1,
+      hasMore: offset + data.length < total,
+    },
+  };
+}
+
+/**
+ * Returns all locks for a specific funderAddress, optionally filtered by invoiceId,
+ * with offset pagination.
+ *
+ * @param {string} funderAddress
+ * @param {Object} [opts]
+ * @param {string} [opts.invoiceId]  - Optional invoiceId filter.
+ * @param {number} [opts.limit=20]   - Page size (1–100).
+ * @param {number} [opts.page=1]     - 1-based page number.
+ * @returns {{ data: Object[], meta: { total: number, page: number, limit: number, totalPages: number, hasMore: boolean } }}
+ */
+function getInvestorLocksByAddress(funderAddress, { invoiceId, limit = 20, page = 1 } = {}) {
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const safePage = Math.max(1, page);
+  let items = [..._lockStore.values()].filter((l) => l.funderAddress === funderAddress);
+  if (invoiceId) {
+    items = items.filter((l) => l.invoiceId === invoiceId);
+  }
+  const total = items.length;
+  const offset = (safePage - 1) * safeLimit;
+  const data = items.slice(offset, offset + safeLimit);
+  return {
+    data,
+    meta: {
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit) || 1,
+      hasMore: offset + data.length < total,
+    },
+  };
+}
+
+/** Clear all locks (test helper). */
 function clearInvestorLocks() {
-  investorLocks.length = 0;
+  _lockStore.clear();
 }
 
-/**
- * Populates sample data for testing/development.
- *
- * @returns {void}
- */
+/** Seed representative test fixtures (test helper). */
 function seedInvestorLocks() {
-  const samples = [
-    {
-      funderAddress: 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK',
-      claimNotBefore: '2026-01-01T00:00:00Z',
-      investorEffectiveYieldBps: 850,
-      invoiceId: 'inv_7788',
-    },
-    {
-      funderAddress: 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL',
-      claimNotBefore: '2026-02-01T00:00:00Z',
-      investorEffectiveYieldBps: 700,
-      invoiceId: 'inv_2244',
-    },
-  ];
+  const addr1 = 'GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOUJ3LNLRK';
+  const addr2 = 'GDGQVOKHW4VEJRU2TETD8G6RWJ3TVM3VROMV7I3ESNITIBLL6QL6RAIL';
 
-  samples.forEach((sample) => {
-    setInvestorLock(sample);
-  });
+  for (let i = 1; i <= 5; i++) {
+    setInvestorLock({ funderAddress: addr1, claimNotBefore: `2026-0${i}-01T00:00:00Z`, investorEffectiveYieldBps: 500 + i * 50, invoiceId: `inv_${7788 + i - 1}` });
+  }
+  setInvestorLock({ funderAddress: addr2, claimNotBefore: '2026-06-01T00:00:00Z', investorEffectiveYieldBps: 800, invoiceId: 'inv_9900' });
 }
 
 module.exports = {
+  persistCommitment,
+  updateCommitment,
+  findCommitments,
   validateAddress,
   setInvestorLock,
-  getInvestorLocksByAddress,
-  getAllInvestorLocks,
   getInvestorLock,
+  getAllInvestorLocks,
+  getInvestorLocksByAddress,
   clearInvestorLocks,
   seedInvestorLocks,
 };

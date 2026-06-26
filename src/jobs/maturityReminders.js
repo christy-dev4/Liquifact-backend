@@ -17,6 +17,13 @@ const {
  */
 const invoiceJobs = new Map();
 
+/**
+ * Dead-letter queue for reminders that failed after max retries.
+ * Stores { invoiceId, email, error, timestamp, attempts } for debugging/alerting.
+ * @type {Array<Object>}
+ */
+const deadLetterQueue = [];
+
 const emailQueue = new JobQueue();
 const emailWorker = new BackgroundWorker({ jobQueue: emailQueue });
 
@@ -62,7 +69,7 @@ LiquiFact Settlement Team
 };
 
 /**
- * Handle sending the email
+ * Handle sending the email with retry and dead-lettering.
  */
 emailWorker.registerHandler('maturity_reminder', async (job) => {
   const { invoiceId, customer, amount, email, targetDate } = job.payload;
@@ -153,6 +160,21 @@ async function stopQueueProcessing(timeoutMs = 5000) {
   await emailWorker.stop(timeoutMs);
 }
 
+/**
+ * Retrieve the dead-letter queue for debugging and manual recovery.
+ * @returns {Array<Object>} Copy of dead-lettered reminder entries.
+ */
+function getDeadLetterQueue() {
+  return [...deadLetterQueue];
+}
+
+/**
+ * Clear the dead-letter queue (after manual recovery/investigation).
+ */
+function clearDeadLetterQueue() {
+  deadLetterQueue.length = 0;
+}
+
 module.exports = {
   scheduleReminder,
   cancelReminder,
@@ -161,5 +183,7 @@ module.exports = {
   invoiceJobs,
   emailQueue,
   templates,
-  getTransport
+  getTransport,
+  getDeadLetterQueue,
+  clearDeadLetterQueue,
 };

@@ -20,18 +20,24 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const { callSorobanContract } = require('./services/soroban');
+const { createSecurityMiddleware } = require('./middleware/security');
+const { auditMiddleware } = require('./middleware/audit');
+const requestId = require('./middleware/requestId');
+const { correlationIdMiddleware } = require('./middleware/correlationId');
 const invoiceService = require('./services/invoiceService');
 const { resolveEscrowAddress } = require('./config/escrowMap');
+const { getEscrowStateWithProjection } = require('./services/escrowRead');
 const { createCorsOptions, isCorsOriginRejectedError } = require('./config/cors');
-const { validateInvoiceQueryParams, validateInvoicePayload } = require('./utils/validators');
+const { validateInvoiceQueryParams } = require('./utils/validators');
+const { computeEscrowDerivedFields } = require('./services/escrowDerived');
+const { invoiceCreateSchema, parseValidationErrors } = require('./schemas/invoice');
 const {
   invoiceBodyLimit,
   jsonBodyLimit,
   payloadTooLargeHandler,
   urlencodedBodyLimit,
 } = require('./middleware/bodySizeLimits');
-const { performHealthChecks } = require('./services/health');
+const { performHealthChecks, performReadinessChecks } = require('./services/health');
 const responseHelper = require('./utils/responseHelper');
 const logger = require('./logger');
 const { metricsAuth, metricsHandler } = require('./metrics');
@@ -73,6 +79,17 @@ function handleInternalError(err, req, res, _next) {
     return;
   }
 
+  // AppError: use the status it carries
+  if (err && err.status && err.status >= 400 && err.status < 500) {
+    res.status(err.status).json({
+      error: {
+        code: err.code || String(err.status),
+        message: err.detail || err.title || err.message,
+      },
+    });
+    return;
+  }
+
   logger.error({ err, reqId: req.id }, 'Internal server error');
   if (isDevelopment) {
     res.status(500).json({
@@ -101,13 +118,25 @@ function createApp() {
   // ── 1. CORS ──────────────────────────────────────────────────────────────
   app.use(cors(createCorsOptions()));
 
+  // ── 1.a. KYC webhook raw body parser ──────────────────────────────────────
+  // Incoming provider webhooks must be verified against the raw JSON body.
+  app.use('/api/kyc/webhook', express.raw({ type: 'application/json', limit: '100kb' }));
+
   // ── 2 & 3. Body-size guardrails ──────────────────────────────────────────
   app.use(...jsonBodyLimit());
   app.use(...urlencodedBodyLimit());
 
+  // Apply security headers middleware
+  app.use(createSecurityMiddleware());
+  app.use(auditMiddleware);
+  app.use(requestId);
+  app.use(correlationIdMiddleware);
+
   // ── 4. Routes ────────────────────────────────────────────────────────────
 
-  // Health check (liveness probe)
+  // ── Health / Liveness / Readiness ──────────────────────────────────────
+
+  // Liveness probe — no external dependencies
   app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
@@ -117,10 +146,42 @@ function createApp() {
     });
   });
 
-  // Readiness check (dependency-aware)
+  // Liveness alias (Kubernetes convention)
+  app.get('/healthz', (req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'liquifact-api',
+      version: '0.1.0',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // Full health check (all dependencies)
   app.get('/ready', async (req, res) => {
     try {
       const { healthy, checks } = await performHealthChecks();
+      const status = healthy ? 200 : 503;
+
+      res.status(status).json({
+        ready: healthy,
+        service: 'liquifact-api',
+        timestamp: new Date().toISOString(),
+        checks,
+      });
+    } catch (error) {
+      res.status(503).json({
+        ready: false,
+        service: 'liquifact-api',
+        timestamp: new Date().toISOString(),
+        error: error.message,
+      });
+    }
+  });
+
+  // Readiness probe (critical deps only: DB, Soroban RPC)
+  app.get('/readyz', async (req, res) => {
+    try {
+      const { healthy, checks } = await performReadinessChecks();
       const status = healthy ? 200 : 503;
 
       res.status(status).json({
@@ -146,7 +207,9 @@ function createApp() {
       description: 'Global Invoice Liquidity Network on Stellar',
       endpoints: {
         health: 'GET /health',
+        healthz: 'GET /healthz',
         ready: 'GET /ready',
+        readyz: 'GET /readyz',
         invoices: 'GET/POST /api/invoices',
         escrow: 'GET /api/escrow/:invoiceId',
         marketplace: 'GET /api/marketplace',
@@ -157,9 +220,15 @@ function createApp() {
 
   // Invoices — GET (list)
   app.get('/api/invoices', async (req, res) => {
-    const { isValid, errors, validatedParams } = validateInvoiceQueryParams(req.query);
+    const { isValid, fieldErrors, validatedParams } = validateInvoiceQueryParams(req.query);
     if (!isValid) {
-      return res.status(400).json({ errors });
+      return res.status(400).json({
+        type: 'https://liquifact.io/problems/validation-error',
+        title: 'Validation Error',
+        status: 400,
+        detail: 'Query parameters contain invalid values.',
+        fieldErrors,
+      });
     }
     const invoices = await invoiceService.getInvoices(validatedParams);
     res.json({
@@ -170,11 +239,17 @@ function createApp() {
 
   // Invoices — POST (create) with strict payload validation and 512 KB body limit
   app.post('/api/invoices', ...invoiceBodyLimit(), (req, res) => {
-    const { isValid, errors } = validateInvoicePayload(req.body);
+    const result = invoiceCreateSchema.safeParse(req.body);
 
-    if (!isValid) {
-      res.status(400).json({ errors });
-      return;
+    if (!result.success) {
+      const fieldErrors = parseValidationErrors(result.error);
+      return res.status(400).json({
+        type: 'https://liquifact.io/problems/validation-error',
+        title: 'Validation Error',
+        status: 400,
+        detail: 'Invoice payload contains invalid or missing fields.',
+        fieldErrors,
+      });
     }
 
     res.status(201).json({
@@ -199,27 +274,24 @@ function createApp() {
         });
       }
 
-      /**
-       * Soroban operation for escrow lookup using resolved contract address.
-       * 
-       * @returns {Promise<object>} Escrow state with contract address
-       */
-      const operation = async () => {
-        return { 
-          invoiceId, 
-          escrowAddress,
-          status: 'not_found', 
-          fundedAmount: 0 
-        };
-      };
+      // Read from projection, cache, or live read fallback
+      const state = await getEscrowStateWithProjection(invoiceId);
 
-      const data = await callSorobanContract(operation);
+      const derived = computeEscrowDerivedFields(state);
+
+      const data = {
+        ...state,
+        ...derived,
+        escrowAddress
+      };
 
       // Include escrow address in response headers
       res.set('X-Escrow-Address', escrowAddress);
       res.json({
         data,
-        message: 'Escrow state read from Soroban contract via robust integration wrapper.',
+        message: state.fromProjection 
+          ? 'Escrow state read from event projection.'
+          : 'Escrow state read from live Soroban contract.',
       });
     } catch (error) {
       res.status(500).json({ error: error.message || 'Error fetching escrow state' });

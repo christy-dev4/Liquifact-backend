@@ -321,6 +321,15 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
       RedisEscrowSummaryCache: jest.fn(),
     }));
 
+    // Mock escrowRead.getEscrowStateWithProjection so it doesn't hit the DB projection
+    jest.mock('../src/services/escrowRead', () => {
+      const actual = jest.requireActual('../src/services/escrowRead');
+      return {
+        ...actual,
+        getEscrowStateWithProjection: jest.fn(),
+      };
+    });
+
     app = require('../src/index');
   });
 
@@ -335,9 +344,9 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
 
   it('includes apyPercent, fundedPercent, daysToMaturity in response', async () => {
     const request = require('supertest');
-    const { callSorobanContract } = require('../src/services/soroban');
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
 
-    callSorobanContract.mockImplementation(async (op) => ({
+    getEscrowStateWithProjection.mockResolvedValue({
       invoiceId: 'inv_500',
       status: 'active',
       fundedAmount: 500,
@@ -345,10 +354,10 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
       annualRatePercent: 8.5,
       maturityDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
       ledgerSequence: 1234,
-    }));
+    });
 
     const res = await request(app)
-      .get('/v1/escrow/inv_500')
+      .get('/api/escrow/inv_500')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(200);
@@ -363,17 +372,17 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
 
   it('returns null derived fields when state lacks source data', async () => {
     const request = require('supertest');
-    const { callSorobanContract } = require('../src/services/soroban');
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
 
-    callSorobanContract.mockImplementation(async (op) => ({
+    getEscrowStateWithProjection.mockResolvedValue({
       invoiceId: 'inv_501',
       status: 'not_found',
       fundedAmount: 0,
       ledgerSequence: 1234,
-    }));
+    });
 
     const res = await request(app)
-      .get('/v1/escrow/inv_501')
+      .get('/api/escrow/inv_501')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(200);
@@ -388,33 +397,35 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
     resolveEscrowAddress.mockReturnValue(null);
 
     const res = await request(app)
-      .get('/v1/escrow/inv_999')
+      .get('/api/escrow/inv_999')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(404);
   });
 
-  it('returns 401 without auth token', async () => {
+  it('returns 200 without auth token (public route)', async () => {
     const request = require('supertest');
-    const res = await request(app).get('/v1/escrow/inv_500');
-    expect(res.status).toBe(401);
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
+    getEscrowStateWithProjection.mockResolvedValue({ invoiceId: 'inv_500', status: 'active' });
+    const res = await request(app).get('/api/escrow/inv_500');
+    expect(res.status).toBe(200);
   });
 
   it('merges derived fields with raw escrow state (non-destructive)', async () => {
     const request = require('supertest');
-    const { callSorobanContract } = require('../src/services/soroban');
+    const { getEscrowStateWithProjection } = require('../src/services/escrowRead');
 
-    callSorobanContract.mockImplementation(async (op) => ({
+    getEscrowStateWithProjection.mockResolvedValue({
       invoiceId: 'inv_502',
       status: 'active',
       fundedAmount: 250,
       totalAmount: 500,
       annualRatePercent: 12,
       ledgerSequence: 999,
-    }));
+    });
 
     const res = await request(app)
-      .get('/v1/escrow/inv_502')
+      .get('/api/escrow/inv_502')
       .set('Authorization', `Bearer ${makeToken()}`);
 
     expect(res.status).toBe(200);
@@ -424,5 +435,171 @@ describe('GET /v1/escrow/:invoiceId — derived fields in response', () => {
     // derived fields added
     expect(res.body.data.apyPercent).toBe(12);
     expect(res.body.data.fundedPercent).toBe(50);
+  });
+});
+
+// ── resolveReferenceTime ──────────────────────────────────────────────────────
+
+const { resolveReferenceTime } = require('../src/services/escrowDerived');
+
+describe('resolveReferenceTime', () => {
+  it('prefers ledgerCloseTime (epoch seconds) over opts.now', () => {
+    const ledger = new Date('2026-04-27T00:00:00.000Z');
+    const later = new Date('2026-04-28T00:00:00.000Z');
+    const result = resolveReferenceTime({
+      ledgerCloseTime: ledger.getTime() / 1000, // seconds
+      now: later,
+    });
+    expect(result.getTime()).toBe(ledger.getTime());
+  });
+
+  it('prefers ledgerCloseTime as Date over opts.now', () => {
+    const ledger = new Date('2026-04-27T00:00:00.000Z');
+    const later = new Date('2026-04-28T00:00:00.000Z');
+    const result = resolveReferenceTime({ ledgerCloseTime: ledger, now: later });
+    expect(result.getTime()).toBe(ledger.getTime());
+  });
+
+  it('falls back to opts.now when ledgerCloseTime is absent', () => {
+    const now = new Date('2026-04-28T00:00:00.000Z');
+    const result = resolveReferenceTime({ now });
+    expect(result.getTime()).toBe(now.getTime());
+  });
+
+  it('falls back to opts.now when ledgerCloseTime is null', () => {
+    const now = new Date('2026-04-28T00:00:00.000Z');
+    const result = resolveReferenceTime({ ledgerCloseTime: null, now });
+    expect(result.getTime()).toBe(now.getTime());
+  });
+
+  it('falls back to opts.now when ledgerCloseTime is 0', () => {
+    const now = new Date('2026-04-28T00:00:00.000Z');
+    const result = resolveReferenceTime({ ledgerCloseTime: 0, now });
+    expect(result.getTime()).toBe(now.getTime());
+  });
+
+  it('falls back to wall clock when both ledgerCloseTime and now are absent', () => {
+    const before = Date.now();
+    const result = resolveReferenceTime({});
+    const after = Date.now();
+    expect(result.getTime()).toBeGreaterThanOrEqual(before);
+    expect(result.getTime()).toBeLessThanOrEqual(after);
+  });
+});
+
+// ── computeDaysToMaturity — ledger time ───────────────────────────────────────
+
+describe('computeDaysToMaturity — ledger time', () => {
+  const MATURITY = new Date('2026-05-27T12:00:00.000Z');
+
+  it('uses ledgerCloseTime (epoch seconds) when provided', () => {
+    const ledger = new Date('2026-04-27T12:00:00.000Z');
+    const result = computeDaysToMaturity(MATURITY, {
+      ledgerCloseTime: ledger.getTime() / 1000,
+    });
+    expect(result).toBe(30);
+  });
+
+  it('uses ledgerCloseTime (Date) when provided', () => {
+    const ledger = new Date('2026-04-27T12:00:00.000Z');
+    const result = computeDaysToMaturity(MATURITY, { ledgerCloseTime: ledger });
+    expect(result).toBe(30);
+  });
+
+  it('ledger time overrides opts.now', () => {
+    // ledger says 30 days out; opts.now says 1 day out — ledger wins
+    const ledger = new Date('2026-04-27T12:00:00.000Z'); // 30 days before maturity
+    const closer = new Date('2026-05-26T12:00:00.000Z'); // 1 day before maturity
+    const result = computeDaysToMaturity(MATURITY, {
+      ledgerCloseTime: ledger.getTime() / 1000,
+      now: closer,
+    });
+    expect(result).toBe(30);
+  });
+
+  it('falls back to opts.now when ledgerCloseTime missing', () => {
+    const now = new Date('2026-04-27T12:00:00.000Z');
+    const result = computeDaysToMaturity(MATURITY, { now });
+    expect(result).toBe(30);
+  });
+
+  it('accepts legacy bare Date as second argument (backwards compat)', () => {
+    const now = new Date('2026-04-27T12:00:00.000Z');
+    const result = computeDaysToMaturity(MATURITY, now);
+    expect(result).toBe(30);
+  });
+
+  it('marks invoice overdue when ledger time is past maturity', () => {
+    const ledger = new Date('2026-06-27T12:00:00.000Z'); // 31 days after maturity
+    const result = computeDaysToMaturity(MATURITY, {
+      ledgerCloseTime: ledger.getTime() / 1000,
+    });
+    expect(result).toBe(-31);
+  });
+
+  it('returns 0 when ledger time equals maturity exactly', () => {
+    const result = computeDaysToMaturity(MATURITY, {
+      ledgerCloseTime: MATURITY.getTime() / 1000,
+    });
+    expect(result).toBe(0);
+  });
+});
+
+// ── computeEscrowDerivedFields — ledger time ──────────────────────────────────
+
+describe('computeEscrowDerivedFields — ledger time', () => {
+  const MATURITY_ISO = '2026-05-27T12:00:00.000Z';
+
+  it('uses ledgerCloseTime (epoch seconds) for daysToMaturity', () => {
+    const ledger = new Date('2026-04-27T12:00:00.000Z');
+    const state = {
+      fundedAmount: 500,
+      totalAmount: 1000,
+      annualRatePercent: 8.5,
+      maturityDate: MATURITY_ISO,
+    };
+    const result = computeEscrowDerivedFields(state, {
+      ledgerCloseTime: ledger.getTime() / 1000,
+    });
+    expect(result.daysToMaturity).toBe(30);
+    expect(result.apyPercent).toBe(8.5);
+    expect(result.fundedPercent).toBe(50);
+  });
+
+  it('ledgerCloseTime beats opts.now', () => {
+    const ledger = new Date('2026-04-27T12:00:00.000Z'); // 30 days out
+    const later = new Date('2026-05-26T12:00:00.000Z');  // 1 day out
+    const state = { fundedAmount: 0, totalAmount: 100, annualRatePercent: 5, maturityDate: MATURITY_ISO };
+    const result = computeEscrowDerivedFields(state, {
+      ledgerCloseTime: ledger.getTime() / 1000,
+      now: later,
+    });
+    expect(result.daysToMaturity).toBe(30);
+  });
+
+  it('falls back to opts.now when ledgerCloseTime absent', () => {
+    const now = new Date('2026-04-27T12:00:00.000Z');
+    const state = { fundedAmount: 0, totalAmount: 100, annualRatePercent: 5, maturityDate: MATURITY_ISO };
+    const result = computeEscrowDerivedFields(state, { now });
+    expect(result.daysToMaturity).toBe(30);
+  });
+
+  it('marks overdue when ledger is past maturity', () => {
+    const ledger = new Date('2026-06-27T12:00:00.000Z'); // 31 days past
+    const state = { fundedAmount: 0, totalAmount: 100, annualRatePercent: 5, maturityDate: MATURITY_ISO };
+    const result = computeEscrowDerivedFields(state, {
+      ledgerCloseTime: ledger.getTime() / 1000,
+    });
+    expect(result.daysToMaturity).toBe(-31);
+  });
+
+  it('null ledgerCloseTime triggers fallback without throwing', () => {
+    const now = new Date('2026-04-27T12:00:00.000Z');
+    const state = { fundedAmount: 0, totalAmount: 100, annualRatePercent: 5, maturityDate: MATURITY_ISO };
+    expect(() =>
+      computeEscrowDerivedFields(state, { ledgerCloseTime: null, now })
+    ).not.toThrow();
+    const result = computeEscrowDerivedFields(state, { ledgerCloseTime: null, now });
+    expect(result.daysToMaturity).toBe(30);
   });
 });

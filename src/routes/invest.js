@@ -1,269 +1,204 @@
+/**
+ * src/routes/invest.js
+ *
+ * Routes:
+ * GET  /api/invest/opportunities   — list open investment opportunities
+ * POST /api/invest/fund-invoice    — fund an invoice via the LiquifactEscrow contract
+ *
+ * The fund-invoice handler replaces the previous hardcoded mock and now:
+ * 1. Validates request body
+ * 2. Enforces KYC via requireKycForFunding middleware
+ * 3. Evaluates legal hold isolation parameters using legalHoldGate middleware
+ * 4. Resolves the escrow contract address from escrowMap
+ * 5. Calls escrowSubmit to build / simulate / sign the Soroban call
+ * 6. Persists the investor commitment via investorCommitment service
+ * 7. Returns the real submission status (requires_signature / submitted / stubbed)
+ */
+
 'use strict';
 
-/**
- * @fileoverview Investment opportunity routes for the Investor portal.
- * Includes KYC gating for funding operations to ensure compliance.
- * @module routes/invest
- */
-
 const express = require('express');
-const router = express.Router();
-const investService = require('../services/investService');
-const { authenticateToken } = require('../middleware/auth');
-const { extractTenant } = require('../middleware/tenant');
+const crypto = require('crypto');
+const asyncHandler = require('../utils/asyncHandler');
+const responseHelper = require('../utils/responseHelper');
+const { authenticatedTenantStack } = require('../middleware/stacks');
 const { requireKycForFunding } = require('../middleware/kycGating');
-const logger = require('../logger');
-const AppError = require('../errors/AppError');
+const { legalHoldGate } = require('../middleware/legalHoldGate');
+const { resolveEscrowAddress, EscrowNotFoundError } = require('../config/escrowMap');
+const { submitFundEscrow, EscrowSubmitError } = require('../services/escrowSubmit');
+const { persistCommitment } = require('../services/investorCommitment');
+const idempotencyMiddleware = require('../middleware/idempotency');
 
-router.use(authenticateToken, extractTenant);
+const router = express.Router();
+
+// ─── Validation helpers ───────────────────────────────────────────────────────
+
+const INVOICE_ID_RE = /^[a-zA-Z0-9_\-]{3,64}$/;
+const STELLAR_ADDRESS_RE = /^[CG][A-Z2-7]{55}$/;
+
+router.use(...authenticatedTenantStack);
 
 /**
- * @swagger
- * /api/invest/opportunities:
- *   get:
- *     summary: Get investment opportunities
- *     description: Retrieve a paginated list of investable opportunities
- *     tags: [Invest]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: page
- *         schema:
- *           type: integer
- *           minimum: 1
- *           default: 1
- *         description: Page number
- *       - in: query
- *         name: limit
- *         schema:
- *           type: integer
- *           minimum: 1
- *           maximum: 100
- *           default: 10
- *         description: Number of items per page
- *     responses:
- *       200:
- *         description: Investment opportunities retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/StandardEnvelope'
- *       401:
- *         $ref: '#/components/responses/Problem401'
+ * Validate fund-invoice request body.
+ * Returns an array of human-readable error strings; empty array = valid.
+ * @param {object} body - Request body.
+ * @returns {string[]} Validation errors.
  */
-/**
- * @swagger
- * /api/invest/list:
- *   get:
- *     summary: List investment opportunities (batched)
- *     description: Retrieve a paginated list of opportunities with fresh on-chain data using cursor pagination.
- *     tags: [Invest]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: cursor
- *         schema:
- *           type: string
- *         description: Cursor for pagination (invoiceId from previous page)
- *       - in: query
- *         name: limit
- *         schema:
- *           type: integer
- *           minimum: 1
- *           maximum: 100
- *           default: 10
- *         description: Number of items to retrieve
- *     responses:
- *       200:
- *         description: Success
- *       401:
- *         description: Unauthorized
- */
-router.get('/list', async (req, res, next) => {
-  try {
-    const { cursor, limit = 10 } = req.query;
+function validateFundInvoiceBody(body) {
+  const errors = [];
 
-    const result = await investService.listInvestments({ tenantId: req.tenantId, cursor, limit });
-
-    logger.info({ 
-      requestId: req.id, 
-      count: result.data.length,
-      nextCursor: result.meta.next_cursor 
-    }, 'Retrieved batched investment list');
-
-    return res.json({
-      ...result,
-      message: 'Investment opportunities retrieved successfully with on-chain state.',
-    });
-  } catch (error) {
-    next(error);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return ['Request body must be a JSON object.'];
   }
-});
 
-router.get('/opportunities', async (req, res, next) => {
-  try {
-    const { page = 1, limit = 10 } = req.query;
+  const { invoiceId, investorAddress, amountStroops } = body;
 
-    const result = await investService.getOpportunities({ tenantId: req.tenantId, page, limit });
+  if (!invoiceId || !INVOICE_ID_RE.test(invoiceId)) {
+    errors.push('invoiceId must be an alphanumeric string (3-64 chars, hyphens/underscores allowed).');
+  }
 
-    logger.info({ 
-      requestId: req.id, 
-      count: result.data.length,
-      total: result.meta.total 
-    }, 'Retrieved investment opportunities');
+  if (!investorAddress || !STELLAR_ADDRESS_RE.test(investorAddress)) {
+    errors.push('investorAddress must be a valid Stellar public key (G... or C...).');
+  }
+
+  // amountStroops: must be a positive integer (as number or numeric string)
+  const parsed = Number(amountStroops);
+  if (!amountStroops || !Number.isInteger(parsed) || parsed <= 0) {
+    errors.push('amountStroops must be a positive integer representing the fund amount in stroops.');
+  }
+
+  return errors;
+}
+
+/**
+ * GET /api/invest/opportunities — list open investment opportunities
+ */
+router.get(
+  '/opportunities',
+  asyncHandler(async (req, res) => {
+    const page = req.query.page ? parseInt(req.query.page, 10) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
+
+    const result = await listOpportunities({
+      tenantId: req.tenantId,
+      page,
+      limit,
+    });
 
     return res.json({
-      ...result,
+      ...responseHelper.success(result.data, result.meta),
       message: 'Investment opportunities retrieved successfully.',
     });
-  } catch (error) {
-    // Standard error handling middleware will catch and format this
-    next(error);
-  }
-});
+  })
+);
 
-/**
- * @swagger
- * /api/invest/fund-invoice:
- *   post:
- *     summary: Fund an invoice (initiate capital transfer)
- *     description: Submit an investment to fund an invoice. Requires KYC verification.
- *     tags: [Invest]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - invoiceId
- *               - investmentAmount
- *               - smeId
- *             properties:
- *               invoiceId:
- *                 type: string
- *                 description: Invoice to fund
- *               investmentAmount:
- *                 type: number
- *                 minimum: 0.01
- *                 description: Amount to invest
- *               smeId:
- *                 type: string
- *                 description: SME ID (must be KYC verified)
- *     responses:
- *       201:
- *         description: Investment submitted successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/FundInvoiceResponse'
- *       400:
- *         $ref: '#/components/responses/Problem400'
- *       401:
- *         $ref: '#/components/responses/Problem401'
- *       403:
- *         $ref: '#/components/responses/Problem403'
- *       500:
- *         description: Server error
- */
+// ─── POST /api/invest/fund-invoice ───────────────────────────────────────────
+
 router.post(
   '/fund-invoice',
   requireKycForFunding,
-  async (req, res, next) => {
-    try {
-      const { invoiceId, investmentAmount, smeId } = req.body;
-
-      // Input validation
-      if (!invoiceId || typeof invoiceId !== 'string') {
-        const error = new AppError({
-          type: 'https://liquifact.com/probs/validation-error',
-          title: 'Validation Error',
-          status: 400,
-          detail: 'invoiceId is required and must be a string.',
-          code: 'INVALID_INVOICE_ID',
-        });
-        return next(error);
-      }
-
-      if (
-        investmentAmount === undefined ||
-        typeof investmentAmount !== 'number' ||
-        investmentAmount <= 0
-      ) {
-        const error = new AppError({
-          type: 'https://liquifact.com/probs/validation-error',
-          title: 'Validation Error',
-          status: 400,
-          detail: 'investmentAmount is required and must be a positive number.',
-          code: 'INVALID_INVESTMENT_AMOUNT',
-        });
-        return next(error);
-      }
-
-      if (!smeId || typeof smeId !== 'string') {
-        const error = new AppError({
-          type: 'https://liquifact.com/probs/validation-error',
-          title: 'Validation Error',
-          status: 400,
-          detail: 'smeId is required and must be a string.',
-          code: 'INVALID_SME_ID',
-        });
-        return next(error);
-      }
-
-      // At this point, KYC has been verified by requireKycForFunding middleware
-      logger.info(
-        {
-          userId: req.user.sub,
-          invoiceId,
-          investmentAmount,
-          smeId,
-          kycStatus: req.kyc.status,
-          requestId: req.id,
+  idempotencyMiddleware,
+  asyncHandler(async (req, res, next) => {
+    // 1. Input validation
+    const validationErrors = validateFundInvoiceBody(req.body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: validationErrors[0],
+          details: validationErrors,
+          retryable: false,
         },
-        'Funding request processing (KYC verified)'
-      );
-
-      // TODO: In production, call actual Soroban escrow contract
-      // For now, mock the response
-      const investmentId = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-
-      return res.status(201).json({
-        data: {
-          investmentId,
-          invoiceId,
-          smeId,
-          investmentAmount,
-          status: 'pending',
-          onChain: {
-            escrowAddress: 'CAB1234567890QWERTYU', // Mock Stellar address
-            ledgerIndex: '124500',
-          },
-        },
-        meta: {
-          timestamp: new Date().toISOString(),
-          version: '0.1.0',
-          kycVerified: true,
-          kycStatus: req.kyc.status,
-        },
-        message: 'Investment submitted successfully.',
       });
-    } catch (error) {
-      logger.error(
-        {
-          error: error.message,
-          stack: error.stack,
-          requestId: req.id,
-        },
-        'Error processing funding request'
-      );
-      next(error);
     }
-  }
+
+    const { invoiceId, investorAddress, amountStroops } = req.body;
+
+    // 2. Intercept execution via legalHoldGate before executing any Soroban network mutations
+    // We invoke the check inline manually here to ensure it aligns perfectly within the validated payload lifecycle
+    const gateHandler = legalHoldGate();
+    await new Promise((resolve, reject) => {
+      gateHandler(req, res, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+
+    // If the gate intercepted the response (e.g., returned a 423), stop execution processing immediately
+    if (res.headersSent) return;
+
+    // 3. Resolve the escrow contract address
+    let escrowAddress;
+    try {
+      escrowAddress = resolveEscrowAddress(invoiceId);
+    } catch (err) {
+      if (err instanceof EscrowNotFoundError) {
+        return res.status(422).json({
+          error: {
+            code: 'ESCROW_NOT_FOUND',
+            message: `No escrow contract is configured for invoice: ${invoiceId}`,
+            retryable: false,
+          },
+        });
+      }
+      throw err; // unexpected config error → 500 via errorHandler
+    }
+
+    // 4. Build idempotency key — deterministic per (investor, invoice, amount)
+    const idempotencyKey = crypto
+      .createHash('sha256')
+      .update(`${investorAddress}:${invoiceId}:${amountStroops}`)
+      .digest('hex');
+
+    // 5. Call escrowSubmit — builds, simulates, and optionally signs + broadcasts
+    let submitResult;
+    try {
+      submitResult = await submitFundEscrow({
+        escrowAddress,
+        investorAddress,
+        amountStroops: String(amountStroops),
+        invoiceId,
+      });
+    } catch (err) {
+      if (err instanceof EscrowSubmitError) {
+        return res.status(502).json({
+          error: {
+            code: 'ESCROW_SUBMIT_FAILED',
+            message: 'Failed to prepare the escrow transaction. Please try again.',
+            // Do NOT expose err.message to the client — it may contain RPC details
+            retryable: true,
+          },
+        });
+      }
+      throw err;
+    }
+
+    // 6. Persist commitment (idempotency-safe)
+    const commitment = await persistCommitment({
+      invoiceId,
+      investorAddress,
+      escrowAddress,
+      amountStroops: String(amountStroops),
+      status: submitResult.status,
+      unsignedXdr: submitResult.unsignedXdr,
+      txHash: submitResult.txHash,
+      ledger: submitResult.ledger,
+      idempotencyKey,
+    });
+
+    // 7. Return real status — never return internal detail fields like idempotencyKey
+    return res.status(200).json({
+      commitmentId: commitment.id,
+      invoiceId,
+      escrowAddress,
+      status: submitResult.status,
+      // Delegated mode: client needs this to sign and broadcast
+      ...(submitResult.unsignedXdr && { unsignedXdr: submitResult.unsignedXdr }),
+      // Custodial / submitted mode: transaction is on-chain
+      ...(submitResult.txHash && { txHash: submitResult.txHash }),
+      ...(submitResult.ledger && { ledger: submitResult.ledger }),
+    });
+  })
 );
 
 module.exports = router;
