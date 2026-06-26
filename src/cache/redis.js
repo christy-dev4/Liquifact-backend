@@ -7,6 +7,41 @@ const MAX_TTL_SECONDS = 300;
 const DEFAULT_LEDGER_GAP_THRESHOLD = 3;
 const MAX_LEDGER_GAP_THRESHOLD = 1000;
 
+const redis = require('redis');
+
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+let redisClient = null;
+let isRedisConnected = false;
+
+if (process.env.NODE_ENV !== 'test' || process.env.USE_REDIS_TEST === 'true') {
+  redisClient = redis.createClient({ url: REDIS_URL });
+
+  redisClient.on('connect', () => {
+    isRedisConnected = true;
+    console.log('Redis client linked securely.');
+  });
+
+  redisClient.on('error', (err) => {
+    isRedisConnected = false;
+    console.warn('Redis connection degraded or broken:', err.message);
+  });
+
+  redisClient.connect().catch((err) => {
+    console.warn('Initial Redis connection handshake failed:', err.message);
+  });
+}
+
+/**
+ * Returns the active Redis client context along with its real-time health availability flag.
+ */
+function getRedisClient() {
+  return { client: redisClient, isAvailable: isRedisConnected };
+}
+
+module.exports = {
+  getRedisClient,
+};
+
 /**
  * Parses a raw value into a positive integer within a specified range.
  * @param {any} rawValue The value to parse.
