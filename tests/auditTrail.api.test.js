@@ -2,17 +2,36 @@
 
 /**
  * @fileoverview API tests for the invoice audit trail endpoints.
- * Covers: trail retrieval, CSV export with escaping, pagination, authz rejection,
- * tenant isolation, and state-transition history.
+ * Covers: trail retrieval, streaming CSV export with formula-injection escaping,
+ * pagination, authz rejection, tenant isolation, and state-transition history.
  */
 
+const { Readable } = require('stream');
+
 jest.mock('../src/db/knex');
-jest.mock('../src/middleware/apiKey', () => ({
-  apiKeyAuth: jest.fn((req, res, next) => {
+jest.mock('../src/middleware/apiKeyAuth', () => ({
+  authenticateApiKey: jest.fn(() => jest.fn((req, res, next) => {
     req.apiClient = { clientId: 'api-client-1' };
     next();
-  }),
+  })),
+  API_KEY_HEADER: 'x-api-key',
+  timingSafeStringEqual: (a, b) => a === b,
 }));
+
+// ── Mock the streaming helpers so CSV export tests don't need a real DB ───────
+// We expose setMockRows() so each test can control what the stream emits.
+let mockRows = [];
+const setMockRows = (rows) => { mockRows = rows; };
+
+jest.mock('../src/services/auditLogStore', () => {
+  const { Readable, Transform } = require('stream');
+  const original = jest.requireActual('../src/services/auditLogStore');
+  return {
+    ...original,
+    streamAuditEvents: jest.fn(() => Readable.from(mockRows, { objectMode: true })),
+    appendAuditEvent: jest.fn().mockResolvedValue(undefined),
+  };
+});
 
 const express = require('express');
 const request = require('supertest');
@@ -393,5 +412,489 @@ describe('GET /api/admin/audit/invoices/:invoiceId/export', () => {
     expect(res.status).toBe(200);
     const parsed = JSON.parse(res.text);
     expect(parsed).toHaveLength(3);
+  });
+});
+
+// ── Streaming CSV export (new behaviour) ─────────────────────────────────────
+
+/** Minimal DB row as returned from audit_log_events. */
+function makeDbRow(overrides = {}) {
+  return {
+    id: 1,
+    created_at: new Date('2024-01-15T10:00:00Z'),
+    actor_id: 'admin-1',
+    action: 'UPDATE',
+    target_type: 'invoice',
+    target_id: 'inv-stream',
+    status_code: 200,
+    ip_address: '127.0.0.1',
+    user_agent: 'jest',
+    ...overrides,
+  };
+}
+
+describe('GET /api/admin/audit/invoices/:invoiceId/export — streaming CSV', () => {
+  let app;
+
+  beforeEach(() => {
+    setMockRows([]);
+    clearAuditLogs();
+    app = buildApp();
+  });
+
+  it('returns 401 without auth', async () => {
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-001/export?format=csv')
+      .set('x-tenant-id', TENANT_A);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 400 for an invalid (too-long) invoiceId', async () => {
+    const longId = 'x'.repeat(129);
+    const res = await request(app)
+      .get(`/api/admin/audit/invoices/${longId}/export?format=csv`)
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+    expect(res.status).toBe(400);
+  });
+
+  it('returns text/csv content-type and attachment disposition', async () => {
+    setMockRows([makeDbRow()]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-stream/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/csv/);
+    expect(res.headers['content-disposition']).toMatch(/attachment/);
+    expect(res.headers['content-disposition']).toMatch(/inv-stream/);
+  });
+
+  it('emits header-only row when audit trail is empty', async () => {
+    setMockRows([]); // no rows
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-empty/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.status).toBe(200);
+    expect(res.text.trim()).toBe(
+      'id,timestamp,actor,action,resourceType,resourceId,statusCode,ipAddress,userAgent'
+    );
+  });
+
+  it('streams header + one data row for a single event', async () => {
+    setMockRows([makeDbRow()]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-stream/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    const lines = res.text.split('\n').filter(Boolean);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(
+      'id,timestamp,actor,action,resourceType,resourceId,statusCode,ipAddress,userAgent'
+    );
+    expect(lines[1]).toContain('admin-1');
+    expect(lines[1]).toContain('inv-stream');
+  });
+
+  it('streams 500 rows without buffering (large trail)', async () => {
+    const rows = Array.from({ length: 500 }, (_, i) =>
+      makeDbRow({ id: i + 1, target_id: `inv-${i}` })
+    );
+    setMockRows(rows);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-large/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    const lines = res.text.split('\n').filter(Boolean);
+    expect(lines).toHaveLength(501); // 1 header + 500 data rows
+  });
+
+  // Formula-injection safety ────────────────────────────────────────────────
+
+  it('escapes = prefix in actor field (formula injection prevention)', async () => {
+    setMockRows([makeDbRow({ actor_id: '=SUM(A1)' })]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-inject/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.status).toBe(200);
+    expect(res.text).not.toMatch(/(?<!['])=SUM/); // bare = must not appear
+    expect(res.text).toContain("'=SUM(A1)");
+  });
+
+  it('escapes + prefix in actor field', async () => {
+    setMockRows([makeDbRow({ actor_id: '+malicious' })]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-inject/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.text).toContain("'+malicious");
+  });
+
+  it('escapes - prefix in actor field', async () => {
+    setMockRows([makeDbRow({ actor_id: '-2+3' })]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-inject/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.text).toContain("'-2+3");
+  });
+
+  it('escapes @ prefix in actor field', async () => {
+    setMockRows([makeDbRow({ actor_id: '@SUM(1)' })]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-inject/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.text).toContain("'@SUM(1)");
+  });
+
+  it('wraps comma-containing fields in double-quotes', async () => {
+    setMockRows([makeDbRow({ actor_id: 'alice,bob' })]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-comma/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.text).toContain('"alice,bob"');
+  });
+
+  it('doubles embedded double-quotes per RFC 4180', async () => {
+    setMockRows([makeDbRow({ actor_id: 'admin"quoted"' })]);
+    const res = await request(app)
+      .get('/api/admin/audit/invoices/inv-quote/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(res.text).toContain('"admin""quoted"""');
+  });
+
+  // Tenant isolation ────────────────────────────────────────────────────────
+
+  it('passes tenantId to streamAuditEvents for DB-level isolation', async () => {
+    const { streamAuditEvents } = require('../src/services/auditLogStore');
+    setMockRows([]);
+    await request(app)
+      .get('/api/admin/audit/invoices/inv-iso/export?format=csv')
+      .set('Authorization', `Bearer ${makeToken(TENANT_A)}`)
+      .set('x-tenant-id', TENANT_A);
+
+    expect(streamAuditEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: TENANT_A }),
+    );
+  });
+});
+
+describe('Retention policy and legal-hold mutation audit', () => {
+  const db = require('../src/db/knex');
+  const { appendAuditEvent, REDACTED } = require('../src/services/auditLogStore');
+  const { emitRetentionAuditSafely } = require('../src/middleware/auditLog');
+  const retentionRouter = require('../src/routes/retention');
+
+  const POLICY_ID = '11111111-1111-4111-8111-111111111111';
+  const HOLD_ID = '22222222-2222-4222-8222-222222222222';
+  const INVOICE_ID = '33333333-3333-4333-8333-333333333333';
+
+  let retentionApp;
+
+  function makeQueryChain(handlers = {}) {
+    const query = {
+      where: jest.fn(function where(arg) {
+        if (typeof arg === 'function') {
+          arg.call(query);
+        }
+        return query;
+      }),
+      whereNull: jest.fn(function whereNull() { return query; }),
+      orWhere: jest.fn(function orWhere() { return query; }),
+      leftJoin: jest.fn(function leftJoin() { return query; }),
+      select: jest.fn(function select() { return query; }),
+      orderBy: jest.fn(function orderBy() { return query; }),
+      insert: jest.fn(function insert() { return query; }),
+      update: jest.fn(function update() { return query; }),
+      returning: jest.fn(function returning() {
+        return Promise.resolve(
+          typeof handlers.returning === 'function' ? handlers.returning() : handlers.returning || [],
+        );
+      }),
+      first: jest.fn(function first() {
+        return Promise.resolve(
+          typeof handlers.first === 'function' ? handlers.first() : handlers.first ?? null,
+        );
+      }),
+    };
+    return query;
+  }
+
+  function buildRetentionApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.user = { sub: 'admin-retention-1', tenantId: TENANT_A };
+      req.tenantId = TENANT_A;
+      req.userId = 'admin-retention-1';
+      next();
+    });
+    app.use('/api/retention', retentionRouter);
+    app.use((err, req, res, _next) => {
+      res.status(err.status || 500).json({ error: err.detail || err.message || 'error' });
+    });
+    return app;
+  }
+
+  beforeEach(() => {
+    appendAuditEvent.mockClear();
+    appendAuditEvent.mockResolvedValue(undefined);
+    retentionApp = buildRetentionApp();
+  });
+
+  it('audits retention policy create with actor, tenant, target, and after snapshot', async () => {
+    const createdPolicy = {
+      id: POLICY_ID,
+      tenant_id: TENANT_A,
+      name: '5-Year Retention',
+      description: 'Purge after five years',
+      retention_days: 1825,
+      pii_fields: ['customer_name', 'customer_email'],
+      is_active: true,
+    };
+
+    db.mockImplementation((table) => {
+      if (table === 'retention_policies') {
+        return makeQueryChain({
+          first: null,
+          returning: [createdPolicy],
+        });
+      }
+      return makeQueryChain();
+    });
+
+    const res = await request(retentionApp)
+      .post('/api/retention/policies')
+      .set('Authorization', `Bearer ${makeToken(TENANT_A)}`)
+      .set('x-tenant-id', TENANT_A)
+      .send({
+        name: '5-Year Retention',
+        description: 'Purge after five years',
+        retentionDays: 1825,
+        piiFields: ['customer_name', 'customer_email'],
+        isActive: true,
+        apiKey: 'must-be-redacted',
+      });
+
+    expect(res.status).toBe(201);
+    expect(appendAuditEvent).toHaveBeenCalledTimes(1);
+    expect(appendAuditEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'retention_mutation',
+        action: 'retention.policy.create',
+        actorType: 'user',
+        actorId: 'admin-1',
+        targetType: 'retention_policy',
+        targetId: POLICY_ID,
+        statusCode: 201,
+        metadata: expect.objectContaining({
+          tenantId: TENANT_A,
+          before: null,
+          after: expect.objectContaining({ id: POLICY_ID, name: '5-Year Retention' }),
+        }),
+      }),
+    );
+  });
+
+  it('audits retention policy update with before and after snapshots', async () => {
+    const existingPolicy = {
+      id: POLICY_ID,
+      tenant_id: TENANT_A,
+      name: 'Old Policy',
+      description: 'Before',
+      retention_days: 365,
+      pii_fields: ['customer_name'],
+      is_active: true,
+    };
+    const updatedPolicy = {
+      ...existingPolicy,
+      name: 'Updated Policy',
+      retention_days: 730,
+    };
+
+    db.mockImplementation((table) => {
+      if (table === 'retention_policies') {
+        return makeQueryChain({
+          first: existingPolicy,
+          returning: [updatedPolicy],
+        });
+      }
+      return makeQueryChain();
+    });
+
+    const res = await request(retentionApp)
+      .put(`/api/retention/policies/${POLICY_ID}`)
+      .set('Authorization', `Bearer ${makeToken(TENANT_A)}`)
+      .set('x-tenant-id', TENANT_A)
+      .send({ name: 'Updated Policy', retentionDays: 730 });
+
+    expect(res.status).toBe(200);
+    expect(appendAuditEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'retention.policy.update',
+        targetId: POLICY_ID,
+        metadata: expect.objectContaining({
+          tenantId: TENANT_A,
+          before: expect.objectContaining({ name: 'Old Policy' }),
+          after: expect.objectContaining({ name: 'Updated Policy', retention_days: 730 }),
+        }),
+      }),
+    );
+  });
+
+  it('audits legal-hold create and release with full hold trace', async () => {
+    const activeHold = {
+      id: HOLD_ID,
+      tenant_id: TENANT_A,
+      invoice_id: INVOICE_ID,
+      hold_reason: 'Regulatory review',
+      hold_type: 'regulatory',
+      status: 'active',
+      expires_at: null,
+      placed_by: 'admin-retention-1',
+      released_at: null,
+      release_reason: null,
+    };
+    const releasedHold = {
+      ...activeHold,
+      status: 'released',
+      released_at: new Date().toISOString(),
+      release_reason: 'Investigation closed',
+    };
+
+    let legalHoldPhase = 'create';
+
+    db.mockImplementation((table) => {
+      if (table === 'invoices') {
+        return makeQueryChain({
+          first: { id: INVOICE_ID, tenant_id: TENANT_A, invoice_number: 'INV-001' },
+        });
+      }
+      if (table === 'legal_holds') {
+        if (legalHoldPhase === 'create') {
+          return makeQueryChain({
+            first: null,
+            returning: [activeHold],
+          });
+        }
+        return makeQueryChain({
+          first: activeHold,
+          returning: [releasedHold],
+        });
+      }
+      return makeQueryChain();
+    });
+
+    const createRes = await request(retentionApp)
+      .post('/api/retention/legal-holds')
+      .set('Authorization', `Bearer ${makeToken(TENANT_A)}`)
+      .set('x-tenant-id', TENANT_A)
+      .send({
+        invoiceId: INVOICE_ID,
+        holdReason: 'Regulatory review',
+        holdType: 'regulatory',
+      });
+
+    expect(createRes.status).toBe(201);
+    expect(appendAuditEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'retention.legal_hold.create',
+        targetType: 'legal_hold',
+        targetId: HOLD_ID,
+        metadata: expect.objectContaining({
+          tenantId: TENANT_A,
+          invoiceId: INVOICE_ID,
+          after: expect.objectContaining({ status: 'active' }),
+        }),
+      }),
+    );
+
+    appendAuditEvent.mockClear();
+    legalHoldPhase = 'release';
+
+    const releaseRes = await request(retentionApp)
+      .post(`/api/retention/legal-holds/${HOLD_ID}/release`)
+      .set('Authorization', `Bearer ${makeToken(TENANT_A)}`)
+      .set('x-tenant-id', TENANT_A)
+      .send({ releaseReason: 'Investigation closed' });
+
+    expect(releaseRes.status).toBe(200);
+    expect(appendAuditEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'retention.legal_hold.release',
+        targetId: HOLD_ID,
+        metadata: expect.objectContaining({
+          tenantId: TENANT_A,
+          invoiceId: INVOICE_ID,
+          releaseReason: 'Investigation closed',
+          before: expect.objectContaining({ status: 'active' }),
+          after: expect.objectContaining({
+            status: 'released',
+            release_reason: 'Investigation closed',
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('does not audit cross-tenant policy updates blocked by tenant scoping', async () => {
+    db.mockImplementation((table) => {
+      if (table === 'retention_policies') {
+        return makeQueryChain({ first: null });
+      }
+      return makeQueryChain();
+    });
+
+    const res = await request(retentionApp)
+      .put(`/api/retention/policies/${POLICY_ID}`)
+      .set('Authorization', `Bearer ${makeToken(TENANT_A)}`)
+      .set('x-tenant-id', TENANT_A)
+      .send({ name: 'Should Not Apply' });
+
+    expect(res.status).toBe(404);
+    expect(appendAuditEvent).not.toHaveBeenCalled();
+  });
+
+  it('logs audit persistence failures without breaking the primary mutation', async () => {
+    appendAuditEvent.mockRejectedValueOnce(new Error('audit store unavailable'));
+
+    const req = {
+      user: { sub: 'admin-retention-1' },
+      tenantId: TENANT_A,
+      headers: {},
+      originalUrl: '/api/retention/policies',
+      method: 'POST',
+      ip: '127.0.0.1',
+      get: () => 'jest-agent',
+    };
+
+    await expect(
+      emitRetentionAuditSafely(req, 'retention.policy.create', {
+        targetType: 'retention_policy',
+        targetId: POLICY_ID,
+        statusCode: 201,
+        after: { id: POLICY_ID, apiKey: 'secret-key' },
+        metadata: { tenantId: TENANT_A },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(appendAuditEvent).toHaveBeenCalledTimes(1);
+    const persistedMetadata = appendAuditEvent.mock.calls[0][0].metadata;
+    expect(persistedMetadata.after.apiKey).toBe(REDACTED);
   });
 });

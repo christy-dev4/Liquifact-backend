@@ -8,6 +8,10 @@
 
 const { createAuditLog } = require('./auditLog');
 const logger = require('../logger');
+const { enqueueWebhookDelivery } = require('./webhooks');
+const { getSharedStore } = require('./cacheStore');
+const { invalidatePrefix } = require('../middleware/cache');
+
 
 /**
  * Valid invoice states in the lifecycle
@@ -48,6 +52,12 @@ const TERMINAL_REASON_REQUIRED_STATES = [
 
 const MAX_TRANSITION_REASON_LENGTH = 1024;
 
+/**
+ * Normalizes and sanitizes a transition reason string.
+ *
+ * @param {*} reason - Raw reason input.
+ * @returns {string|null} Sanitized reason, or null if absent or empty.
+ */
 function normalizeTransitionReason(reason) {
   if (reason === null || reason === undefined) {
     return null;
@@ -294,7 +304,7 @@ async function executeTransition({
     auditLogId: auditLog.id,
   }, 'Invoice state transition executed');
 
-  return {
+  const result = {
     success: true,
     previousState: currentState,
     newState: targetState,
@@ -302,6 +312,31 @@ async function executeTransition({
     transitionedAt: auditLog.timestamp,
     transitionedBy: actor,
   };
+
+  // Invalidate marketplace cache so that the new state is reflected
+  // immediately on the next GET /api/marketplace request.
+  invalidatePrefix(getSharedStore(), 'marketplace:');
+
+  // Enqueue a signed webhook delivery job for this transition.
+  // This is fire-and-forget: webhook errors must never fail the transition.
+  enqueueWebhookDelivery({
+    invoiceId,
+    event: `invoice.${currentState}_to_${targetState}`,
+    transition: {
+      from: currentState,
+      to: targetState,
+      actor,
+      reason: normalizedReason,
+      transitionedAt: auditLog.timestamp,
+    },
+  }).catch((err) => {
+    logger.error(
+      { invoiceId, error: err && err.message ? err.message : String(err) },
+      'Failed to enqueue webhook delivery after state transition'
+    );
+  });
+
+  return result;
 }
 
 /**
