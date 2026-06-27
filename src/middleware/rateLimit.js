@@ -13,24 +13,19 @@
  */
 
 const rateLimit = require('express-rate-limit');
-
-const rateLimit = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
 const { getRedisClient } = require('../cache/redis');
 
 // Emulating original parsing utility configuration hooks
-const WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 15 * 60 * 1000;
-const MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS, 10) || 100;
-
 /**
  * Creates an isolated, context-aware rate limiting middleware block.
  * Uses a Redis backing layer if available, otherwise safely falls back to standard memory tracks.
- * * @param {string} scope - The structural namespace isolation marker (e.g., 'global', 'sensitive', 'api-key')
+ * @param {string} scope - The structural namespace isolation marker (e.g., 'global', 'sensitive', 'api-key')
  * @param {number} windowMs - The tracking duration window block in milliseconds
  * @param {number} max - Request limits allowed inside the designated window frame
  * @returns {Function} Express middleware handler
  */
-function createRateLimiter(scope, windowMs = WINDOW_MS, max = MAX_REQUESTS) {
+function createRateLimiter(scope, windowMs = 15 * 60 * 1000, max = 100) {
   const { client, isAvailable } = getRedisClient();
   let store;
 
@@ -69,15 +64,6 @@ function createRateLimiter(scope, windowMs = WINDOW_MS, max = MAX_REQUESTS) {
     }
   });
 }
-
-const globalLimiter = createRateLimiter('global', WINDOW_MS, MAX_REQUESTS);
-const sensitiveLimiter = createRateLimiter('sensitive', 5 * 60 * 1000, 20);
-
-module.exports = {
-  createRateLimiter,
-  globalLimiter,
-  sensitiveLimiter,
-};
 
 /**
  * Parse environment variable as positive integer.
@@ -205,6 +191,7 @@ const apiKeyLimiter = rateLimit({
 });
 
 module.exports = {
+  createRateLimiter,
   globalLimiter,
   sensitiveLimiter,
   apiKeyLimiter,

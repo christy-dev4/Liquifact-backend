@@ -1,18 +1,17 @@
 'use strict';
 
-const SENTRY_DSN = process.env.SENTRY_DSN && process.env.SENTRY_DSN.trim();
 let Sentry = null;
 let enabled = false;
 
 const SENSITIVE_FIELD_NAMES = [
   'authorization',
-  'auth',
   'token',
   'password',
   'secret',
   'x-api-key',
   'api-key',
   'apikey',
+  'api_key',
   'xdr',
   'stellar',
   'invoice',
@@ -60,7 +59,7 @@ function hasSensitivePattern(value) {
   }
 
   const patterns = [
-    /invoice[_\s-]?[a-z0-9]{6,}/i,
+    /invoice[_\s-]?[a-z0-9-]{6,}/i,
     /[a-f0-9]{32,}/,
     /[A-Za-z0-9+/]{40,}/,
     /Bearer\s+[A-Za-z0-9\-_.]+/i,
@@ -149,7 +148,10 @@ function scrubUrl(urlString) {
     
     if (parsed.query && typeof parsed.query === 'object') {
       const scrubbedQuery = deepScrub(parsed.query);
-      parsed.search = url.stringify(scrubbedQuery, { encode: true });
+      const entries = Object.entries(scrubbedQuery);
+      if (entries.length > 0) {
+        parsed.search = '?' + entries.map(([k, v]) => `${k}=${v}`).join('&');
+      }
     }
 
     if (parsed.pathname) {
@@ -158,7 +160,8 @@ function scrubUrl(urlString) {
         if (/^[a-f0-9]{32,}$/i.test(segment) || 
             /invoice/i.test(segment) ||
             /^[A-Za-z0-9+/]{40,}$/.test(segment) ||
-            /^[A-Za-z0-9\-_]{20,}$/.test(segment)) {
+            /^[A-Za-z0-9\-_]{20,}$/.test(segment) ||
+            /^INV[-_][a-z0-9]{4,}$/i.test(segment)) {
           return REDACTED_INVOICE;
         }
         return segment;
@@ -166,7 +169,12 @@ function scrubUrl(urlString) {
       parsed.pathname = scrubbedSegments.join('/');
     }
 
-    return url.format(parsed);
+    const formatted = url.format(parsed);
+    // Avoid encoding plain text that url.parse treated as a bare pathname
+    if (!parsed.protocol && !parsed.host && !/[\/?#]/.test(urlString)) {
+      return urlString;
+    }
+    return formatted;
   } catch (error) {
     return urlString;
   }
@@ -301,7 +309,8 @@ function scrubEvent(event) {
  * @returns {void}
  */
 function initSentry() {
-  if (!SENTRY_DSN) {
+  const dsn = process.env.SENTRY_DSN && process.env.SENTRY_DSN.trim();
+  if (!dsn) {
     console.log('Sentry DSN not provided, observability disabled');
     return;
   }
@@ -310,7 +319,7 @@ function initSentry() {
     Sentry = require('@sentry/node');
 
     Sentry.init({
-      dsn: SENTRY_DSN,
+      dsn,
       release: process.env.SENTRY_RELEASE || process.env.npm_package_version || 'liquifact-backend@unknown',
       environment: process.env.SENTRY_ENVIRONMENT || process.env.NODE_ENV || 'development',
       attachStacktrace: true,
