@@ -20,6 +20,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const reconciliationRoutes = require('./routes/reconciliation');
 const { createSecurityMiddleware } = require('./middleware/security');
 const { auditMiddleware } = require('./middleware/audit');
 const requestId = require('./middleware/requestId');
