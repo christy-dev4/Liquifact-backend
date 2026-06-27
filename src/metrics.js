@@ -84,6 +84,13 @@ try {
   };
 }
 
+/** Shared registry — exported so tests can reset it between runs. */
+const registry = new client.Registry();
+
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
+
 const METRIC_REFRESH_INTERVAL_MS = 5000;
 const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
@@ -346,12 +353,6 @@ async function metricsHandler(_req, res) {
 }
 
 /** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
-}
-
 /**
  * Counter: Escrow events successfully processed by the indexer per cycle.
  * Incremented by the number of events persisted in each indexer cycle.
@@ -498,6 +499,20 @@ const readinessGauge = new client.Gauge({
   registers: [registry],
 });
 
+/**
+ * Counter: Body size limit rejections.
+ * Incremented each time a request is rejected with 413 Payload Too Large.
+ * Labelled by `type` (json, urlencoded, invoice, raw, unknown) to allow
+ * detection of DoS attacks targeting specific body parsers.
+ * @type {import('prom-client').Counter}
+ */
+const bodySizeLimitRejectionsTotal = new client.Counter({
+  name: 'body_size_limit_rejections_total',
+  help: 'Total number of request body-size limit rejections (413 Payload Too Large), labelled by limit type for DoS detection',
+  labelNames: ['type'],
+  registers: [registry],
+});
+
 module.exports = {
   registry,
   metricsAuth,
@@ -506,4 +521,5 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
+  bodySizeLimitRejectionsTotal,
 };
