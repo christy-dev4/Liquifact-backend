@@ -84,6 +84,13 @@ try {
   };
 }
 
+/** Shared registry - exported so tests can reset it between runs. */
+const registry = new client.Registry();
+
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
+
 const METRIC_REFRESH_INTERVAL_MS = 5000;
 const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
@@ -136,7 +143,7 @@ function refreshMetrics() {
         queueLength += Number(stats.queueLength || 0);
         retryQueueLength += Number(stats.retryQueueLength || 0);
       }
-    } catch (err) {
+    } catch (_err) {
       // Preserve existing metrics if a registered queue becomes invalid.
     }
   }
@@ -148,7 +155,7 @@ function refreshMetrics() {
       if (stats && typeof stats.processingCount === 'number') {
         workerInFlight += stats.processingCount;
       }
-    } catch (err) {
+    } catch (_err) {
       // Preserve existing metrics if a registered worker becomes invalid.
     }
   }
@@ -171,6 +178,10 @@ function refreshMetrics() {
     `liquifact_worker_inflight_count ${workerInFlight}\n`;
 }
 
+/**
+ * Starts periodic background sampling for registered queues and workers.
+ * @returns {void}
+ */
 function startMetricsRefresh() {
   if (refreshTimer) {
     return;
@@ -182,6 +193,10 @@ function startMetricsRefresh() {
   }
 }
 
+/**
+ * Stops periodic background metric sampling when it is active.
+ * @returns {void}
+ */
 function stopMetricsRefresh() {
   if (!refreshTimer) {
     return;
@@ -229,6 +244,10 @@ function registerWorker(worker) {
   startMetricsRefresh();
 }
 
+/**
+ * Clears registered metric sources and resets sampled gauges for tests.
+ * @returns {void}
+ */
 function resetMetricsForTests() {
   registeredJobQueues.clear();
   registeredWorkers.clear();
@@ -343,13 +362,6 @@ function metricsAuth(req, res, next) {
 async function metricsHandler(_req, res) {
   res.set('Content-Type', registry.contentType);
   res.end(await registry.metrics());
-}
-
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
-
-if (typeof client.collectDefaultMetrics === 'function') {
-  client.collectDefaultMetrics({ register: registry });
 }
 
 /**
@@ -506,4 +518,17 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
+  escrowIndexerEventsProcessedTotal,
+  escrowIndexerEventsSkippedTotal,
+  escrowIndexerCycleFailuresTotal,
+  escrowIndexerLastCursorAdvanceTimestampSeconds,
+  escrowReconciliationMismatches,
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
+  maturityReminderDeadLetterTotal,
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+  sorobanCircuitBreakerStateTransitionsTotal,
+  readinessGauge,
 };
