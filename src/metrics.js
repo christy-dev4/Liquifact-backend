@@ -618,16 +618,22 @@ const readinessGauge = new client.Gauge({
 });
 
 /**
- * Counter: Body size limit rejections.
- * Incremented each time a request is rejected with 413 Payload Too Large.
- * Labelled by `type` (json, urlencoded, invoice, raw, unknown) to allow
- * detection of DoS attacks targeting specific body parsers.
+ * Counter: operator alerts raised when `contractListRefresh` detects an on-chain
+ * LiquifactEscrow wasm `SCHEMA_VERSION` that diverges from the expected/known
+ * registry version.
+ *
+ * Labelled by the comparison `status` (`ahead` — contract is newer than anything
+ * the backend tracks; `unknown` — version not present in the registry) so ops can
+ * distinguish an upgrade from an unexpected/rolled-back deployment. A non-zero
+ * value is an actionable signal that the backend may not yet support the on-chain
+ * contract — see `docs/wasm-ops.md`.
+ *
  * @type {import('prom-client').Counter}
  */
-const bodySizeLimitRejectionsTotal = new client.Counter({
-  name: 'body_size_limit_rejections_total',
-  help: 'Total number of request body-size limit rejections (413 Payload Too Large), labelled by limit type for DoS detection',
-  labelNames: ['type'],
+const contractWasmVersionMismatchAlertsTotal = new client.Counter({
+  name: 'contract_wasm_version_mismatch_alerts_total',
+  help: 'Total operator alerts raised when contractListRefresh detects an on-chain wasm SCHEMA_VERSION mismatch',
+  labelNames: ['status'],
   registers: [registry],
 });
 
@@ -639,21 +645,5 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
-  bodySizeLimitRejectionsTotal,
-  escrowIndexerEventsProcessedTotal,
-  escrowIndexerEventsSkippedTotal,
-  escrowIndexerCycleFailuresTotal,
-  escrowIndexerLastCursorAdvanceTimestampSeconds,
-  escrowReconciliationMismatches,
-  escrowReconciliationMismatchedInvoicesGauge,
-  escrowReconciliationDriftMagnitudeGauge,
-  escrowReconciliationDriftAlertsTotal,
-  footprintCacheHitsTotal,
-  footprintCacheMissesTotal,
-  footprintCacheEvictionsTotal,
-  sorobanCircuitBreakerStateTransitionsTotal,
-  readinessGauge,
-  maturityReminderDeliveryAttemptsTotal,
-  maturityReminderDeliverySuccessTotal,
-  maturityReminderDeadLetterTotal,
+  contractWasmVersionMismatchAlertsTotal,
 };
