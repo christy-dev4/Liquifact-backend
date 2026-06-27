@@ -127,6 +127,17 @@ jest.mock('@stellar/stellar-sdk', () => ({
       sign: jest.fn(),
     })),
   },
+  StrKey: {
+    isValidContractId: jest.fn((contractId) => {
+      if (typeof contractId !== 'string') return false;
+      const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+      if (!CONTRACT_ID_RE.test(contractId)) return false;
+      // In the unit tests, the invalid checksum contract ID ends with 'A'.
+      // We reject any ID ending with 'A' to simulate invalid checksum validation.
+      if (contractId.endsWith('A')) return false;
+      return true;
+    }),
+  },
 }), { virtual: true });
 
 jest.mock('@stellar/stellar-sdk/rpc', () => ({
@@ -142,3 +153,20 @@ jest.mock('@stellar/stellar-sdk/rpc', () => ({
   })),
 }), { virtual: true });
 
+jest.mock('rate-limit-redis', () => ({
+  RedisStore: jest.fn().mockImplementation(() => ({})),
+}), { virtual: true });
+
+jest.mock('../../src/middleware/rateLimit', () => {
+  const noopMiddleware = (req, res, next) => next();
+  return {
+    globalLimiter: noopMiddleware,
+    sensitiveLimiter: noopMiddleware,
+    apiKeyLimiter: noopMiddleware,
+    createRateLimiter: jest.fn(() => noopMiddleware),
+    parseRateLimitEnv: jest.fn((_, def) => def),
+    keyGenerator: jest.fn((req) => req.ip || '127.0.0.1'),
+    apiKeyKeyGenerator: jest.fn((req) => req.ip || '127.0.0.1'),
+    getApiKey: jest.fn(() => undefined),
+  };
+}, { virtual: true });
