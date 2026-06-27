@@ -128,3 +128,18 @@ test_output.txt
 .env
 .env.*
 !.env.example
+
+# Local SQLite database
+*.sqlite3
+*.sqlite
+
+# Local data directory (API keys DB, etc.)
+data/
+
+# Load test reports
+tests/load/reports/
+
+# Scratch / one-off scripts
+fix-invoice.js
+parse-ast.js
+contracts/target/

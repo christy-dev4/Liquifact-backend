@@ -71,7 +71,7 @@ const baseDefinition = {
           },
           message: { type: 'string' },
         },
-        additionalProperties: true,
+        additionalProperties: false,
       },
       /**
        * Successful response from `GET /api/marketplace`.
@@ -90,7 +90,7 @@ const baseDefinition = {
               limit: { type: 'integer', minimum: 1, maximum: 100 },
               totalPages: { type: 'integer', minimum: 0 },
             },
-            additionalProperties: true,
+            additionalProperties: false,
           },
           message: { type: 'string' },
         },
@@ -123,7 +123,7 @@ const baseDefinition = {
                 additionalProperties: true,
               },
             },
-            additionalProperties: true,
+            additionalProperties: false,
           },
           meta: {
             type: 'object',
@@ -134,7 +134,7 @@ const baseDefinition = {
               kycVerified: { type: 'boolean' },
               kycStatus: { type: 'string' },
             },
-            additionalProperties: true,
+            additionalProperties: false,
           },
           message: { type: 'string' },
         },
@@ -158,7 +158,54 @@ const baseDefinition = {
           retryable: { type: 'boolean' },
           retry_hint: { type: 'string' },
         },
-        additionalProperties: true,
+        additionalProperties: false,
+      },
+      /**
+       * Summary row from the `reconciliation_runs` table.
+       * Intentionally excludes the per-invoice `results` column so that
+       * raw on-chain funding values are not surfaced in bulk list responses.
+       */
+      ReconciliationRun: {
+        type: 'object',
+        required: ['id', 'total', 'matches', 'mismatches', 'errors', 'reconciled_at', 'created_at'],
+        properties: {
+          id: {
+            type: 'string',
+            format: 'uuid',
+            description: 'Unique identifier for the reconciliation run.',
+          },
+          total: {
+            type: 'integer',
+            minimum: 0,
+            description: 'Total number of invoices inspected in this run.',
+          },
+          matches: {
+            type: 'integer',
+            minimum: 0,
+            description: 'Number of invoices where DB and on-chain funded amounts matched.',
+          },
+          mismatches: {
+            type: 'integer',
+            minimum: 0,
+            description: 'Number of invoices where a funded-amount discrepancy was detected.',
+          },
+          errors: {
+            type: 'integer',
+            minimum: 0,
+            description: 'Number of invoices that could not be compared due to an error.',
+          },
+          reconciled_at: {
+            type: 'string',
+            format: 'date-time',
+            description: 'ISO 8601 timestamp when the reconciliation run completed.',
+          },
+          created_at: {
+            type: 'string',
+            format: 'date-time',
+            description: 'ISO 8601 timestamp when the row was inserted.',
+          },
+        },
+        additionalProperties: false,
       },
     },
     responses: {

@@ -6,9 +6,27 @@
  */
 
 const { getKycProviderConfig } = require('./kycService');
+const { escrowIndexerLastCursorAdvanceTimestampSeconds, readinessGauge } = require('../metrics');
+const db = require('../db/knex');
+const cfg = require('../config');
 
 /**
- * Checks if the Soroban RPC endpoint is reachable.
+ * Classify Soroban RPC latency against configurable thresholds.
+ * Returns "healthy" for latency <= warn, "degraded" for latency > warn && <= fail,
+ * and "unhealthy" for latency > fail.
+ * @param {number} latencyMs Measured latency in milliseconds.
+ * @returns {'healthy'|'degraded'|'unhealthy'}
+ */
+function classifySorobanLatency(latencyMs) {
+  const warnMs = parseInt(process.env.SOROBAN_LATENCY_WARN_MS, 10) || 200;
+  const failMs = parseInt(process.env.SOROBAN_LATENCY_FAIL_MS, 10) || 500;
+  if (latencyMs <= warnMs) return 'healthy';
+  if (latencyMs <= failMs) return 'degraded';
+  return 'unhealthy';
+}
+
+/**
+ * Checks if the Soroban RPC endpoint is reachable and classifies latency.
  * @returns {Promise<{status: string, latency?: number, error?: string}>}
  */
 async function checkSorobanHealth() {
@@ -33,7 +51,8 @@ async function checkSorobanHealth() {
     const latency = Date.now() - start;
 
     if (response.ok) {
-      return { status: 'healthy', latency };
+      const classification = classifySorobanLatency(latency);
+      return { status: classification, latency };
     }
     return { status: 'unhealthy', latency, error: `HTTP ${response.status}` };
   } catch (error) {
@@ -43,25 +62,36 @@ async function checkSorobanHealth() {
 }
 
 /**
- * Checks if the database is reachable.
+ * Checks if the database is reachable via a raw query.
+ * Uses knex to run `SELECT 1` and measures latency.
+ * Does not expose connection strings or hostnames in the response.
  * @returns {Promise<{status: string, latency?: number, error?: string}>}
  */
 async function checkDatabaseHealth() {
   if (!process.env.DATABASE_URL) {
     return { status: 'not_configured' };
   }
-  return { status: 'not_implemented', error: 'Database health check pending' };
+
+  const start = Date.now();
+  try {
+    await db.raw('SELECT 1');
+    const latency = Date.now() - start;
+    return { status: 'healthy', latency };
+  } catch (_error) {
+    const latency = Date.now() - start;
+    return { status: 'unhealthy', latency, error: 'Database unreachable' };
+  }
 }
 
 /**
  * Checks escrow reconciliation status.
- *
+ * 
  * @returns {Promise<{status: string, lastRun?: string, mismatches?: number, error?: string}>} Reconciliation health status.
  */
 async function checkReconciliationHealth() {
   try {
     const { getReconciliationSummary } = require('../jobs/reconcileEscrow');
-    const summary = getReconciliationSummary();
+    const summary = await getReconciliationSummary();
 
     if (!summary) {
       return { status: 'not_run', error: 'Reconciliation has not been run yet' };
@@ -70,10 +100,12 @@ async function checkReconciliationHealth() {
     const lastRun = new Date(summary.reconciledAt);
     const hoursSinceLastRun = (Date.now() - lastRun.getTime()) / (1000 * 60 * 60);
 
+    // Consider unhealthy if last run was more than 25 hours ago (allowing 1 hour grace)
     if (hoursSinceLastRun > 25) {
       return { status: 'stale', lastRun: summary.reconciledAt, error: 'Reconciliation not run recently' };
     }
 
+    // Unhealthy if there are mismatches
     if (summary.mismatches > 0) {
       return { status: 'mismatches', lastRun: summary.reconciledAt, mismatches: summary.mismatches };
     }
@@ -121,22 +153,115 @@ async function checkKycHealth() {
 }
 
 /**
+ * Checks escrow indexer staleness.
+ * Returns 'disabled' when the indexer is not enabled.
+ * Returns 'stale' when the cursor hasn't advanced within the configured threshold.
+ * Returns 'healthy' when the cursor has advanced recently or initially (gauge not yet set).
+ *
+ * @returns {Promise<{status: string, elapsedSeconds?: number, lastAdvanceTimestamp?: number, threshold?: number, error?: string}>} Indexer staleness health status.
+ */
+async function checkIndexerStaleness() {
+  try {
+    const config = cfg.get();
+
+    // Check if indexer is enabled
+    if (config.ESCROW_INDEXER_ENABLED !== 'true') {
+      return { status: 'disabled' };
+    }
+
+    // Get the last advance timestamp from gauge
+    const lastAdvanceTimestamp = escrowIndexerLastCursorAdvanceTimestampSeconds.get();
+
+    // If gauge has never been set, treat as healthy (no false positive on startup)
+    if (lastAdvanceTimestamp === undefined || lastAdvanceTimestamp === 0) {
+      return { status: 'healthy', lastAdvanceTimestamp: 0, threshold: config.ESCROW_INDEXER_STALE_THRESHOLD_SECONDS };
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const elapsedSeconds = now - (lastAdvanceTimestamp || 0);
+    const threshold = config.ESCROW_INDEXER_STALE_THRESHOLD_SECONDS || 300;
+
+    if (elapsedSeconds > threshold) {
+      return {
+        status: 'stale',
+        elapsedSeconds,
+        lastAdvanceTimestamp,
+        threshold,
+        error: `Cursor has not advanced for ${elapsedSeconds} seconds (threshold: ${threshold})`,
+      };
+    }
+
+    return {
+      status: 'healthy',
+      elapsedSeconds,
+      lastAdvanceTimestamp,
+      threshold,
+    };
+  } catch (error) {
+    return { status: 'error', error: error.message };
+  }
+}
+
+/**
  * Performs all dependency health checks.
  * @returns {Promise<{healthy: boolean, checks: Object}>}
  */
 async function performHealthChecks() {
-  const [soroban, database, kyc] = await Promise.all([
+  const [soroban, database, kyc, indexerStaleness] = await Promise.all([
     checkSorobanHealth(),
     checkDatabaseHealth(),
     checkKycHealth(),
+    checkIndexerStaleness(),
   ]);
 
-  const checks = { soroban, database, kyc };
+  const checks = { soroban, database, kyc, indexerStaleness };
   const healthy =
     (soroban.status === 'healthy' || soroban.status === 'unknown') &&
-    (kyc.status === 'healthy' || kyc.status === 'disabled');
+    (kyc.status === 'healthy' || kyc.status === 'disabled') &&
+    (indexerStaleness.status === 'healthy' || indexerStaleness.status === 'disabled');
 
   return { healthy, checks };
 }
 
-module.exports = { checkSorobanHealth, checkDatabaseHealth, checkKycHealth, performHealthChecks };
+/**
+ * Performs critical-dependency readiness checks (DB, Soroban RPC).
+ * The KYC and indexer checks are omitted because they are not required
+ * for the process to serve traffic — only critical upstream dependencies
+ * that would prevent any request from completing are included.
+ *
+ * Updates the `readiness_gauge` Prometheus metric (1 = ready, 0 = not ready).
+ *
+ * @returns {Promise<{healthy: boolean, checks: {database: Object, soroban: Object}}>}
+ */
+async function performReadinessChecks() {
+  const [database, soroban] = await Promise.all([
+    checkDatabaseHealth(),
+    checkSorobanHealth(),
+  ]);
+
+  const checks = { database, soroban };
+  // Determine overall readiness. Degraded Soroban RPC (slow) does NOT block readiness.
+  const healthy =
+    database.status === 'healthy' &&
+    (soroban.status === 'healthy' || soroban.status === 'degraded' || soroban.status === 'unknown');
+
+  // Set gauge: 1 = ready, 0.5 = degraded, 0 = not ready
+  if (database.status !== 'healthy') {
+    readinessGauge.set(0);
+  } else if (soroban.status === 'degraded') {
+    readinessGauge.set(0.5);
+  } else {
+    readinessGauge.set(healthy ? 1 : 0);
+  }
+
+  return { healthy, checks };
+}
+
+module.exports = {
+  checkSorobanHealth,
+  checkDatabaseHealth,
+  checkKycHealth,
+  checkIndexerStaleness,
+  performHealthChecks,
+  performReadinessChecks,
+};
