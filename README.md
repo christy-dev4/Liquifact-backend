@@ -184,6 +184,44 @@ The application exposes Prometheus metrics on `GET /metrics` (subject to the sam
 
 These gauges are updated by sampling registered `JobQueue` and `BackgroundWorker` instances and are intentionally bounded to avoid high-cardinality labels.
 
+### Body-size limit rejection metrics
+
+The `body_size_limit_rejections_total` counter tracks every request rejected with HTTP 413 Payload Too Large, labelled by the body parser type that rejected it:
+
+| Label `type` | Trigger |
+|---|---|
+| `json` | Rejected by the global JSON body parser (default 100 KB) |
+| `urlencoded` | Rejected by the URL-encoded body parser (default 50 KB) |
+| `invoice` | Rejected by the stricter invoice upload parser (default 512 KB) |
+| `unknown` | Rejected by the generic error handler when content-type cannot be determined |
+
+This counter is designed for **DoS detection**: a sudden spike in any `type` label indicates a potential attack attempting to overwhelm the API with oversized payloads.
+
+#### DoS detection alert rules
+
+The following PromQL alerts detect rapid increases in body-size rejections. A sustained rate of 10+ rejections per minute is a strong signal of a volumetric DoS attempt.
+
+```promql
+# Alert when JSON body-size rejections exceed 10 per minute (potential DoS)
+rate(body_size_limit_rejections_total{type="json"}[5m]) > 0.167
+
+# Alert when urlencoded body-size rejections exceed 10 per minute
+rate(body_size_limit_rejections_total{type="urlencoded"}[5m]) > 0.167
+
+# Aggregate alert across ALL body-size limit types
+sum(rate(body_size_limit_rejections_total[5m])) > 0.167
+```
+
+**Tuning guidance:**
+
+| Environment | Suggested rate threshold | Rationale |
+|---|---|---|
+| Development / CI | `> 0.5` (30/min) | Higher baseline from automated test traffic |
+| Production (normal) | `> 0.167` (10/min) | Expected occasional oversized payloads from legitimate clients |
+| Production (locked down) | `> 0.017` (1/min) | Very low tolerance — almost all oversized payloads are malicious |
+
+For production deployments, include the full YAML alert rule from [`docs/prometheus-rules.yml`](./docs/prometheus-rules.yml).
+
 ---
 
 ## KYC Provider Integration
