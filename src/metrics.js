@@ -108,6 +108,10 @@ let refreshTimer = null;
 /** Shared registry — exported so tests can reset it between runs. */
 const registry = new client.Registry();
 
+if (typeof client.collectDefaultMetrics === 'function') {
+  client.collectDefaultMetrics({ register: registry });
+}
+
 const queueDepthGauge = new client.Gauge({
   name: 'liquifact_job_queue_depth',
   help: 'Number of pending jobs currently waiting in background queues',
@@ -434,7 +438,6 @@ async function metricsHandler(_req, res) {
   res.end(metricsText);
 }
 
-/** Shared registry — exported so tests can reset it between runs. */
 /**
  * Counter: Escrow events successfully processed by the indexer per cycle.
  * Incremented by the number of events persisted in each indexer cycle.
