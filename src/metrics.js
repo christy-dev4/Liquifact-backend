@@ -89,6 +89,9 @@ const registeredJobQueues = new Set();
 const registeredWorkers = new Set();
 let refreshTimer = null;
 
+/** Shared registry — exported so tests can reset it between runs. */
+const registry = new client.Registry();
+
 const queueDepthGauge = new client.Gauge({
   name: 'liquifact_job_queue_depth',
   help: 'Number of pending jobs currently waiting in background queues',
@@ -345,8 +348,7 @@ async function metricsHandler(_req, res) {
   res.end(await registry.metrics());
 }
 
-/** Shared registry — exported so tests can reset it between runs. */
-const registry = new client.Registry();
+
 
 if (typeof client.collectDefaultMetrics === 'function') {
   client.collectDefaultMetrics({ register: registry });
@@ -498,6 +500,69 @@ const readinessGauge = new client.Gauge({
   registers: [registry],
 });
 
+/**
+ * Counter: Redis cache fail-open occurrences.
+ * @type {import('prom-client').Counter}
+ */
+const redisCacheFailOpenTotal = new client.Counter({
+  name: 'redis_cache_fail_open_total',
+  help: 'Total number of times redis cache operations failed open',
+  registers: [registry],
+});
+
+/**
+ * Helper to increment arbitrary metrics dynamically (used in some middleware).
+ *
+ * @param {string} name - Name of the metric.
+ * @param {Object} [labels] - Labels for the metric.
+ */
+function incrementMetric(name, labels = {}) {
+  try {
+    let metric = registry.getSingleMetric(name);
+    if (!metric) {
+      metric = new client.Counter({
+        name,
+        help: `Dynamic counter for ${name}`,
+        labelNames: Object.keys(labels),
+        registers: [registry],
+      });
+    }
+    metric.inc(labels);
+  } catch (err) {
+    // Silently ignore or log error
+  }
+}
+
+/**
+ * Gauge: Number of mismatched invoices.
+ * @type {import('prom-client').Gauge}
+ */
+const escrowReconciliationMismatchedInvoicesGauge = new client.Gauge({
+  name: 'escrow_reconciliation_mismatched_invoices',
+  help: 'Number of mismatched invoices detected in the latest reconciliation run',
+  registers: [registry],
+});
+
+/**
+ * Gauge: Drift magnitude.
+ * @type {import('prom-client').Gauge}
+ */
+const escrowReconciliationDriftMagnitudeGauge = new client.Gauge({
+  name: 'escrow_reconciliation_drift_magnitude',
+  help: 'Magnitude of the drift detected in the latest reconciliation run',
+  registers: [registry],
+});
+
+/**
+ * Counter: Total drift alerts.
+ * @type {import('prom-client').Counter}
+ */
+const escrowReconciliationDriftAlertsTotal = new client.Counter({
+  name: 'escrow_reconciliation_drift_alerts_total',
+  help: 'Total number of drift alerts triggered',
+  registers: [registry],
+});
+
 module.exports = {
   registry,
   metricsAuth,
@@ -506,4 +571,22 @@ module.exports = {
   registerWorker,
   refreshMetrics,
   resetMetricsForTests,
+  escrowIndexerEventsProcessedTotal,
+  escrowIndexerEventsSkippedTotal,
+  escrowIndexerCycleFailuresTotal,
+  escrowIndexerLastCursorAdvanceTimestampSeconds,
+  escrowReconciliationMismatches,
+  escrowReconciliationMismatchedInvoicesGauge,
+  escrowReconciliationDriftMagnitudeGauge,
+  escrowReconciliationDriftAlertsTotal,
+  maturityReminderDeliveryAttemptsTotal,
+  maturityReminderDeliverySuccessTotal,
+  maturityReminderDeadLetterTotal,
+  footprintCacheHitsTotal,
+  footprintCacheMissesTotal,
+  footprintCacheEvictionsTotal,
+  sorobanCircuitBreakerStateTransitionsTotal,
+  readinessGauge,
+  redisCacheFailOpenTotal,
+  incrementMetric,
 };
